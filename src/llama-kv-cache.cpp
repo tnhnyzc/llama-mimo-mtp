@@ -7,10 +7,12 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cinttypes>
 #include <cmath>
 #include <cstring>
 #include <limits>
 #include <map>
+#include <set>
 #include <stdexcept>
 
 static bool ggml_is_power_of_2(int n) {
@@ -487,6 +489,81 @@ void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, ll
     //for (uint32_t s = 0; s < n_stream; ++s) {
     //    LLAMA_LOG_WARN("%s: seq %d: min = %d, max = %d\n", __func__, s, v_cells[s].seq_pos_min(s), v_cells[s].seq_pos_max(s));
     //}
+}
+
+bool llama_kv_cache::seq_commit_cells(
+        llama_seq_id seq_id_src,
+        llama_seq_id seq_id_dst,
+        const std::vector<int64_t> & all_idxs,
+        const std::vector<int32_t> & keep_rows) {
+    GGML_ASSERT(seq_id_src >= 0 && (size_t) seq_id_src < seq_to_stream.size());
+    GGML_ASSERT(seq_id_dst >= 0 && (size_t) seq_id_dst < seq_to_stream.size());
+
+    const uint32_t s_src = seq_to_stream[seq_id_src];
+    const uint32_t s_dst = seq_to_stream[seq_id_dst];
+    if (s_src != s_dst) {
+        LLAMA_LOG_WARN("%s: packed tree commit currently requires source and destination in the same KV stream\n", __func__);
+        return false;
+    }
+
+    auto & cells = v_cells[s_src];
+    auto & head  = v_heads[s_src];
+
+    // collect the KV cell indices we want to keep so we can skip them during cleanup
+    std::set<uint32_t> keep_idxs;
+
+    for (const int32_t row : keep_rows) {
+        if (row < 0 || row >= (int32_t) all_idxs.size()) {
+            LLAMA_LOG_WARN("%s: invalid keep row %d for %zu packed KV rows\n", __func__, row, all_idxs.size());
+            return false;
+        }
+
+        const int64_t gidx = all_idxs[row];
+        if (gidx < 0) {
+            continue;
+        }
+
+        const uint32_t strm = (uint32_t) (gidx / get_size());
+        const uint32_t idx  = (uint32_t) (gidx % get_size());
+        if (strm != s_src || idx >= cells.size() || cells.is_empty(idx) || !cells.seq_has(idx, seq_id_src)) {
+            LLAMA_LOG_WARN("%s: cannot keep row %d with KV idx %" PRId64 "\n", __func__, row, gidx);
+            return false;
+        }
+
+        cells.seq_add(idx, seq_id_dst);
+        keep_idxs.insert(idx);
+    }
+
+    uint32_t new_head = cells.size();
+    for (int32_t row = 0; row < (int32_t) all_idxs.size(); ++row) {
+        const int64_t gidx = all_idxs[row];
+        if (gidx < 0) {
+            continue;
+        }
+
+        const uint32_t strm = (uint32_t) (gidx / get_size());
+        const uint32_t idx  = (uint32_t) (gidx % get_size());
+        if (strm != s_src || idx >= cells.size() || cells.is_empty(idx) || !cells.seq_has(idx, seq_id_src)) {
+            continue;
+        }
+
+        // when src == dst, skip cells that were kept — they must not be removed
+        if (keep_idxs.count(idx)) {
+            continue;
+        }
+
+        if (cells.seq_rm(idx, seq_id_src)) {
+            if (new_head == cells.size()) {
+                new_head = idx;
+            }
+        }
+    }
+
+    if (new_head != cells.size() && new_head < head) {
+        head = new_head;
+    }
+
+    return true;
 }
 
 void llama_kv_cache::seq_keep(llama_seq_id seq_id) {

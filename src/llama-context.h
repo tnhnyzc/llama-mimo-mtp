@@ -6,6 +6,7 @@
 #include "llama-graph.h"
 #include "llama-adapter.h"
 #include "llama-impl.h"
+#include "llama-mtp.h"
 
 #include "ggml-cpp.h"
 #include "ggml-opt.h"
@@ -69,6 +70,26 @@ struct llama_context {
     float * get_embeddings_ith(int32_t i);
     float * get_embeddings_seq(llama_seq_id seq_id);
 
+    ggml_tensor * get_t_h_pre_norm() const;
+    ggml_tensor * get_t_mtp_out()    const;
+
+    void            set_mtp(llama_context * ctx_mtp_in);
+    llama_context * get_mtp() const { return mtp.ctx_mtp; }
+    const std::vector<llama_context *> & get_mtps() const { return mtp.ctxs_mtp; }
+    void            set_mtps(const std::vector<llama_context *> & ctxs_mtp_in);
+    void            set_mtp_layer_idx(int32_t il);
+    bool            set_mtp_tree_verify(
+            const int32_t * parents,
+            const int32_t * depths,
+                  int32_t   n_nodes,
+                  int32_t   n_steps,
+                  int32_t   top_k);
+    void            clear_mtp_tree_verify();
+    void            mtp_flush();
+    bool            commit_mtp_tree_verify(
+            const int32_t * keep_rows,
+                  int32_t   n_keep_rows);
+
     llama_token * get_sampled_tokens() const;
     llama_token   get_sampled_token_ith(int32_t idx);
 
@@ -114,7 +135,8 @@ struct llama_context {
                 const llama_ubatch & ubatch,
                     llm_graph_type   gtype,
             llama_memory_context_i * mctx,
-                       ggml_status & ret);
+                       ggml_status & ret,
+        const llama_mtp_tree_verify * mtp_tree_verify = nullptr);
 
     int encode(const llama_batch & batch_inp);
     int decode(const llama_batch & batch_inp);
@@ -229,9 +251,16 @@ private:
                         llm_graph_result * res,
                       const llama_ubatch & ubatch,
             const llama_memory_context_i * mctx,
-                          llm_graph_type   gtype) const;
+                          llm_graph_type   gtype,
+        const llama_mtp_tree_verify * mtp_tree_verify = nullptr) const;
 
     llm_graph_cb graph_get_cb() const;
+
+    void handle_mtp_for_ubatch(
+            int32_t                n_tokens,
+            const llama_token    * tokens,
+            const llama_pos      * positions,
+            struct ggml_tensor   * t_h_pre_norm);
 
     // TODO: read/write lora adapters and cvec
     size_t state_write_data(llama_io_write_i & io);
@@ -252,6 +281,12 @@ private:
     llama_adapter_loras_ptr loras;
 
     llama_cross cross; // TODO: tmp for handling cross-attention - need something better probably
+
+    llama_mtp mtp;
+    int32_t mtp_layer_idx = -1;
+    llama_mtp_tree_verify mtp_tree_verify_pending;
+    llama_mtp_tree_verify mtp_tree_verify_last;
+    bool mtp_tree_verify_pending_set = false;
 
     std::unique_ptr<llama_memory_i> memory;
 

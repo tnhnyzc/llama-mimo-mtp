@@ -15,6 +15,7 @@
 #include <cmath>
 #include <chrono>
 #include <cstdarg>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <filesystem>
@@ -1514,6 +1515,14 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.op_offload        = !params.no_op_offload;
     cparams.swa_full          = params.swa_full;
     cparams.kv_unified        = params.kv_unified;
+
+    if (const char * env = std::getenv("LLAMA_MIMO_MTP_TREE_SEQ_MAX")) {
+        const int32_t n_seq_max_env = std::atoi(env);
+        if (n_seq_max_env > 0 && (uint32_t) n_seq_max_env > cparams.n_seq_max) {
+            cparams.n_seq_max  = (uint32_t) n_seq_max_env;
+            cparams.kv_unified = true;
+        }
+    }
 
     cparams.type_k = params.cache_type_k;
     cparams.type_v = params.cache_type_v;

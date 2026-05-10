@@ -12,6 +12,7 @@
 #include <climits>
 #include <cmath>
 #include <cstring>
+#include <random>
 #include <unordered_map>
 #include <vector>
 
@@ -617,6 +618,10 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
 }
 
 std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, bool grammar_first) {
+    static bool pq_trace = std::getenv("LLAMA_PQ_STATS") != nullptr;
+    if (pq_trace) {
+        fprintf(stderr, "pq_trace: 4-arg exact-match path taken (draft=%zu)\n", draft.size());
+    }
     GGML_ASSERT(idxs.size() == draft.size() + 1 && "idxs.size() must be draft.size() + 1");
 
     std::vector<llama_token> result;
@@ -653,6 +658,312 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
     }
 
     return common_sampler_sample_and_accept_n(gsmpl, ctx, idxs, draft, grammar_first);
+}
+
+// p/q speculative decoding acceptance
+// For each draft token x sampled from q:
+//   compute p(x) from target model logits (softmax at temperature)
+//   accept with probability min(1, p(x)/q(x))
+//   on reject: resample from max(0, p(x) - q(x)) / Z
+std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, const std::vector<float> & draft_probs, float accept_bias, const std::vector<std::vector<float>> * draft_logits, float logit_blend, const std::vector<std::vector<float>> * draft_probs_all, bool grammar_first, float garbage_thresh, float dist_restore) {
+    GGML_ASSERT(idxs.size() == draft.size() + 1 && "idxs.size() must be draft.size() + 1");
+
+    const bool use_pq = !draft_probs.empty() && draft_probs.size() == draft.size() && gsmpl->params.temp > 0.0f;
+
+    static bool pq_trace = std::getenv("LLAMA_PQ_STATS") != nullptr;
+    if (pq_trace) {
+        fprintf(stderr, "pq_trace: draft=%zu draft_probs=%zu temp=%.3f use_pq=%d\n",
+                draft.size(), draft_probs.size(), gsmpl->params.temp, use_pq);
+    }
+
+    if (!use_pq) {
+        return common_sampler_sample_and_accept_n(gsmpl, ctx, idxs, draft, grammar_first);
+    }
+
+    const float temperature = gsmpl->params.temp;
+    const llama_model * model = llama_get_model(ctx);
+    const llama_vocab * vocab = llama_model_get_vocab(model);
+    (void) vocab;
+
+    // RNG: use the sampler's seed
+    std::mt19937 rng(gsmpl->params.seed == LLAMA_DEFAULT_SEED ? std::random_device{}() : gsmpl->params.seed);
+
+    static bool pq_stats = std::getenv("LLAMA_PQ_STATS") != nullptr;
+    struct pq_call_stats {
+        int n_accept = 0;
+        int n_reject = 0;
+        int n_disagree = 0;
+        int n_garbage_gate = 0;
+        std::vector<float> ratios_accepted;
+        std::vector<float> ratios_rejected;
+        std::vector<float> p_values;
+        std::vector<float> q_values;
+        float sum_ratio = 0.0f;
+    };
+    pq_call_stats cs;
+
+    std::vector<llama_token> result;
+    result.reserve(idxs.size());
+    std::vector<float> probs;
+    probs.reserve(4096);
+    std::vector<float> adj_probs;
+    adj_probs.reserve(4096);
+
+    size_t i = 0;
+    for (; i < draft.size(); i++) {
+        const float q_x = draft_probs[i];
+
+        // get raw target logits for this position
+        gsmpl->set_logits(ctx, idxs[i]);
+
+        auto & cur_p = gsmpl->cur_p;
+
+        llama_sampler_apply(gsmpl->rbudget, &cur_p);
+        if (grammar_first && grammar_should_apply(gsmpl)) {
+            llama_sampler_apply(gsmpl->grmr, &cur_p);
+        }
+
+        // logit blending: add scaled draft logits to target logits
+        const bool has_draft_logits = draft_logits && i < draft_logits->size() && !(*draft_logits)[i].empty();
+        float effective_blend = logit_blend;
+
+        float target_top_logit = -INFINITY;
+        llama_token target_top_token = 0;
+        float mtp_top_logit = -INFINITY;
+        llama_token mtp_top_token = 0;
+
+        if (logit_blend > 0.0f && has_draft_logits) {
+            const auto & dlogits = (*draft_logits)[i];
+            for (size_t j = 0; j < cur_p.size && j < dlogits.size(); j++) {
+                float raw_target = cur_p.data[j].logit;
+                float raw_mtp = dlogits[cur_p.data[j].id];
+
+                if (raw_target > target_top_logit) {
+                    target_top_logit = raw_target;
+                    target_top_token = cur_p.data[j].id;
+                }
+                if (raw_mtp > mtp_top_logit) {
+                    mtp_top_logit = raw_mtp;
+                    mtp_top_token = cur_p.data[j].id;
+                }
+
+                cur_p.data[j].logit += effective_blend * raw_mtp;
+            }
+        } else {
+            for (size_t j = 0; j < cur_p.size; j++) {
+                if (cur_p.data[j].logit > target_top_logit) {
+                    target_top_logit = cur_p.data[j].logit;
+                    target_top_token = cur_p.data[j].id;
+                }
+            }
+        }
+
+        if (pq_stats && target_top_token != mtp_top_token) {
+            cs.n_disagree++;
+        }
+
+        float max_logit = -INFINITY;
+        for (size_t j = 0; j < cur_p.size; j++) {
+            if (cur_p.data[j].logit > max_logit) {
+                max_logit = cur_p.data[j].logit;
+            }
+        }
+
+        float sum_exp = 0.0f;
+        probs.resize(cur_p.size);
+        for (size_t j = 0; j < cur_p.size; j++) {
+            probs[j] = expf((cur_p.data[j].logit - max_logit) / temperature);
+            sum_exp += probs[j];
+        }
+        for (size_t j = 0; j < cur_p.size; j++) {
+            probs[j] /= sum_exp;
+        }
+
+        // distribution restoration: blend target probs with MTP's full distribution
+        if (dist_restore > 0.0f && draft_probs_all && i < draft_probs_all->size() && !(*draft_probs_all)[i].empty()) {
+            const auto & q_all = (*draft_probs_all)[i];
+            float w = dist_restore;
+            float rsum = 0.0f;
+            for (size_t j = 0; j < cur_p.size; j++) {
+                const float q_j = ((size_t) cur_p.data[j].id < q_all.size()) ? q_all[cur_p.data[j].id] : 0.0f;
+                probs[j] = (1.0f - w) * probs[j] + w * q_j;
+                rsum += probs[j];
+            }
+            if (rsum > 0.0f) {
+                for (size_t j = 0; j < cur_p.size; j++) {
+                    probs[j] /= rsum;
+                }
+            }
+        }
+
+        float p_x = 0.0f;
+        const llama_token draft_token = draft[i];
+        for (size_t j = 0; j < cur_p.size; j++) {
+            if (cur_p.data[j].id == draft_token) {
+                p_x = probs[j];
+                break;
+            }
+        }
+
+        const float ratio = (q_x > 0.0f) ? p_x / q_x : 0.0f;
+        const float biased_ratio = std::min(1.0f, ratio * accept_bias);
+        std::uniform_real_distribution<float> uniform(0.0f, 1.0f);
+        const float u = uniform(rng);
+
+        if (pq_stats) {
+            cs.sum_ratio += ratio;
+            cs.p_values.push_back(p_x);
+            cs.q_values.push_back(q_x);
+        }
+
+        if (u < biased_ratio && q_x >= garbage_thresh) {
+            if (pq_stats) cs.ratios_accepted.push_back(ratio);
+            if (pq_stats) cs.n_accept++;
+
+            llama_token accepted_token = draft_token;
+            bool grammar_rejected = false;
+
+            if (!grammar_first && grammar_should_apply(gsmpl)) {
+                llama_token_data single = { draft_token, 1.0f, 0.0f };
+                llama_token_data_array single_arr = { &single, 1, -1, false };
+                llama_sampler_apply(gsmpl->grmr, &single_arr);
+                if (single_arr.data[0].logit == -INFINITY) {
+                    grammar_rejected = true;
+                }
+            }
+
+            if (grammar_rejected) {
+                gsmpl->set_logits(ctx, idxs[i]);
+                llama_sampler_apply(gsmpl->rbudget, &cur_p);
+                llama_sampler_apply(gsmpl->grmr, &cur_p);
+                llama_sampler_apply(gsmpl->chain, &cur_p);
+                accepted_token = cur_p.data[cur_p.selected].id;
+            }
+
+            common_sampler_accept(gsmpl, accepted_token, true);
+            result.push_back(accepted_token);
+
+            if (grammar_rejected) {
+                break;
+            }
+        } else {
+            if (pq_stats) { cs.ratios_rejected.push_back(ratio); cs.n_reject++; }
+            if (pq_stats && q_x < garbage_thresh) { cs.n_garbage_gate++; }
+            // reject: resample from max(0, p(x) - q(x)) / Z
+            // q(j) is the full draft distribution, not just q(draft_token)
+            adj_probs.resize(cur_p.size);
+            float Z = 0.0f;
+            const bool has_q_all = draft_probs_all && i < draft_probs_all->size() && !(*draft_probs_all)[i].empty();
+            if (has_q_all) {
+                const auto & q_all = (*draft_probs_all)[i];
+                for (size_t j = 0; j < cur_p.size; j++) {
+                    const float q_j = ((size_t) cur_p.data[j].id < q_all.size()) ? q_all[cur_p.data[j].id] : 0.0f;
+                    adj_probs[j] = std::max(0.0f, probs[j] - q_j);
+                    Z += adj_probs[j];
+                }
+            } else {
+                // fallback: only have q(draft_token), treat others as 0
+                for (size_t j = 0; j < cur_p.size; j++) {
+                    const float q_j = (cur_p.data[j].id == draft_token) ? q_x : 0.0f;
+                    adj_probs[j] = std::max(0.0f, probs[j] - q_j);
+                    Z += adj_probs[j];
+                }
+            }
+
+            llama_token resampled_id = cur_p.data[0].id;
+            if (Z > 0.0f) {
+                std::uniform_real_distribution<float> dist(0.0f, Z);
+                float r = dist(rng);
+                float cum = 0.0f;
+                for (size_t j = 0; j < cur_p.size; j++) {
+                    cum += adj_probs[j];
+                    if (r < cum) {
+                        resampled_id = cur_p.data[j].id;
+                        break;
+                    }
+                }
+            } else {
+                // fallback: sample from p directly
+                std::uniform_real_distribution<float> dist(0.0f, 1.0f);
+                float r = dist(rng);
+                float cum = 0.0f;
+                for (size_t j = 0; j < cur_p.size; j++) {
+                    cum += probs[j];
+                    if (r < cum) {
+                        resampled_id = cur_p.data[j].id;
+                        break;
+                    }
+                }
+            }
+
+            // apply grammar check to resampled token
+            if (!grammar_first && grammar_should_apply(gsmpl)) {
+                llama_token_data single = { resampled_id, 1.0f, 0.0f };
+                llama_token_data_array single_arr = { &single, 1, -1, false };
+                llama_sampler_apply(gsmpl->grmr, &single_arr);
+                if (single_arr.data[0].logit == -INFINITY) {
+                    // grammar rejects - resample with grammar applied
+                    gsmpl->set_logits(ctx, idxs[i]);
+                    llama_sampler_apply(gsmpl->rbudget, &cur_p);
+                    llama_sampler_apply(gsmpl->grmr, &cur_p);
+                    llama_sampler_apply(gsmpl->chain, &cur_p);
+                    resampled_id = cur_p.data[cur_p.selected].id;
+                }
+            }
+
+            common_sampler_accept(gsmpl, resampled_id, true);
+            result.push_back(resampled_id);
+            break;
+        }
+    }
+
+    // if all draft tokens accepted, sample one more from target
+    if (i == draft.size()) {
+        const llama_token id = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
+        common_sampler_accept(gsmpl, id, true);
+        result.push_back(id);
+    }
+
+    if (pq_stats && (cs.n_accept + cs.n_reject > 0)) {
+        const int total = cs.n_accept + cs.n_reject;
+        int bins[8] = {};
+        for (auto r : cs.ratios_accepted) {
+            if (r < 0.2f) bins[0]++;
+            else if (r < 0.4f) bins[1]++;
+            else if (r < 0.6f) bins[2]++;
+            else if (r < 0.8f) bins[3]++;
+            else if (r < 1.0f) bins[4]++;
+            else if (r < 1.5f) bins[5]++;
+            else if (r < 2.0f) bins[6]++;
+            else bins[7]++;
+        }
+        for (auto r : cs.ratios_rejected) {
+            if (r < 0.2f) bins[0]++;
+            else if (r < 0.4f) bins[1]++;
+            else if (r < 0.6f) bins[2]++;
+            else if (r < 0.8f) bins[3]++;
+            else if (r < 1.0f) bins[4]++;
+            else if (r < 1.5f) bins[5]++;
+            else if (r < 2.0f) bins[6]++;
+            else bins[7]++;
+        }
+        float avg_ratio = cs.sum_ratio / total;
+        float avg_p = 0, avg_q = 0;
+        for (auto v : cs.p_values) avg_p += v;
+        for (auto v : cs.q_values) avg_q += v;
+        avg_p /= total; avg_q /= total;
+
+        fprintf(stderr, "%s: pq_stats accept=%d/%d disagree=%d garbage_gate=%d avg_ratio=%.3f avg_p=%.6f avg_q=%.6f "
+                "hist=[%d,%d,%d,%d,%d,%d,%d,%d] labels=[<0.2,0.4,0.6,0.8,1.0,1.5,2.0,inf)\n",
+                __func__, cs.n_accept, total, cs.n_disagree, cs.n_garbage_gate, avg_ratio, avg_p, avg_q,
+                bins[0], bins[1], bins[2], bins[3], bins[4], bins[5], bins[6], bins[7]);
+        for (int k = 0; k < (int)cs.ratios_rejected.size() && k < 20; k++) {
+            fprintf(stderr, "  reject[%d]: ratio=%.4f p=%.6f q=%.6f\n",
+                    k, cs.ratios_rejected[k], cs.p_values[cs.n_accept + k], cs.q_values[cs.n_accept + k]);
+        }
+    }
+
+    return result;
 }
 
 uint32_t common_sampler_get_seed(const struct common_sampler * gsmpl) {

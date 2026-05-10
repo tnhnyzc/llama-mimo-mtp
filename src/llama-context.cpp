@@ -5,6 +5,7 @@
 #include "llama-impl.h"
 #include "llama-batch.h"
 #include "llama-io.h"
+#include "llama-kv-cache-iswa.h"
 #include "llama-memory.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
@@ -382,6 +383,9 @@ llama_context::~llama_context() {
                     __func__, ggml_backend_buft_name(buft), size_act / (1024.0*1024.0), size_exp / (1024.0*1024.0));
             }
         }
+    }
+    if (mtp.hook_batch.pos != nullptr) {
+        llama_batch_free(mtp.hook_batch);
     }
     ggml_opt_free(opt_ctx);
 }
@@ -1168,7 +1172,12 @@ bool llama_context::set_adapter_cvec(
     return res;
 }
 
-llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+llm_graph_result * llama_context::process_ubatch(
+        const llama_ubatch & ubatch,
+        llm_graph_type gtype,
+        llama_memory_context_i * mctx,
+        ggml_status & ret,
+        const llama_mtp_tree_verify * mtp_tree_verify) {
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
@@ -1180,7 +1189,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
     // the new graph parameters
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
-    const auto gparams = graph_params(res, ubatch, mctx, gtype);
+    const auto gparams = graph_params(res, ubatch, mctx, gtype, mtp_tree_verify);
 
     if (!graph_reuse_disable && res->can_reuse(gparams)) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
@@ -1225,6 +1234,17 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         // FIXME this call causes a crash if any model inputs were not used in the graph and were therefore not allocated
         res->set_inputs(&ubatch);
 
+        if (mtp.pending_t_gpu && ubatch.embd) {
+            struct ggml_tensor * inp_embd = ggml_graph_get_tensor(res->get_gf(), "inp_embd");
+            if (!inp_embd) {
+                inp_embd = ggml_graph_get_tensor(res->get_gf(), "mtp_h_input");
+            }
+            if (inp_embd) {
+                ggml_backend_tensor_copy(mtp.pending_t_gpu, inp_embd);
+            }
+            mtp.pending_t_gpu = nullptr;
+        }
+
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
@@ -1236,6 +1256,14 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     }
 
     ret = GGML_STATUS_SUCCESS;
+
+    if (mtp.ctx_mtp) {
+        handle_mtp_for_ubatch(
+                (int32_t) ubatch.n_tokens,
+                ubatch.token,
+                ubatch.pos,
+                res->t_h_pre_norm);
+    }
 
     return res;
 }
@@ -1531,7 +1559,11 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
 }
 
 int llama_context::decode(const llama_batch & batch_inp) {
-    GGML_ASSERT((!batch_inp.token && batch_inp.embd) || (batch_inp.token && !batch_inp.embd)); // NOLINT
+    const bool has_token = batch_inp.token != nullptr;
+    const bool has_embd  = batch_inp.embd  != nullptr;
+    const bool allow_token_and_embd = model.arch == LLM_ARCH_MIMO2_MTP;
+
+    GGML_ASSERT((has_token != has_embd) || (allow_token_and_embd && has_token && has_embd)); // NOLINT
 
     if (!memory) {
         LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
@@ -1586,6 +1618,43 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     const uint32_t n_tokens_all  = balloc->get_n_tokens();
     const uint32_t n_outputs_all = balloc->get_n_outputs();
+
+    bool has_mtp_tree_verify = mtp_tree_verify_pending_set;
+
+    struct mtp_tree_verify_scope {
+        llama_context * ctx = nullptr;
+        bool active = false;
+
+        ~mtp_tree_verify_scope() {
+            if (active) {
+                ctx->clear_mtp_tree_verify();
+            }
+        }
+    } mtp_tree_verify_cleanup { this, has_mtp_tree_verify };
+
+    const llama_mtp_tree_verify * mtp_tree_verify = nullptr;
+    if (has_mtp_tree_verify) {
+        mtp_tree_verify = &mtp_tree_verify_pending;
+
+        if (mtp_tree_verify->nodes.size() != n_tokens_all) {
+            LLAMA_LOG_ERROR("%s: MTP tree verify node count must match the decode batch (nodes = %zu, n_tokens = %u)\n",
+                    __func__, mtp_tree_verify->nodes.size(), n_tokens_all);
+            return -1;
+        }
+
+        if (n_tokens_all > cparams.n_ubatch) {
+            // Soft fallback: the batch is too large for a single tree-verify
+            // ubatch. Instead of hard-failing and killing the server decode,
+            // drop the tree mask and fall back to normal causal decode.
+            // The speculative path will see an empty tree-verify result and
+            // handle it as a reject.
+            LLAMA_LOG_WARN("%s: MTP tree verify batch exceeds ubatch (n_tokens = %u, n_ubatch = %u); falling back to normal decode\n",
+                    __func__, n_tokens_all, cparams.n_ubatch);
+            clear_mtp_tree_verify();
+            mtp_tree_verify = nullptr;
+            has_mtp_tree_verify = false;
+        }
+    }
 
     if (output_all) {
         // require that all tokens are output
@@ -1689,7 +1758,13 @@ int llama_context::decode(const llama_batch & batch_inp) {
         }
 
         ggml_status status;
-        const auto * res = process_ubatch(ubatch, LLM_GRAPH_TYPE_DECODER, mctx.get(), status);
+        if (mtp_tree_verify && ubatch.n_tokens != mtp_tree_verify->nodes.size()) {
+            LLAMA_LOG_ERROR("%s: MTP tree verify cannot be split across ubatches (ubatch.n_tokens = %u, nodes = %zu)\n",
+                    __func__, ubatch.n_tokens, mtp_tree_verify->nodes.size());
+            return -1;
+        }
+
+        const auto * res = process_ubatch(ubatch, LLM_GRAPH_TYPE_DECODER, mctx.get(), status, mtp_tree_verify);
 
         if (!res) {
             // the last ubatch failed or was aborted -> remove all positions of that ubatch from the memory module
@@ -2149,7 +2224,8 @@ llm_graph_params llama_context::graph_params(
                         llm_graph_result * res,
                       const llama_ubatch & ubatch,
             const llama_memory_context_i * mctx,
-                          llm_graph_type   gtype) const {
+                          llm_graph_type   gtype,
+        const llama_mtp_tree_verify * mtp_tree_verify) const {
     return {
         /*.arch        =*/ model.arch,
         /*.hparams     =*/ model.hparams,
@@ -2164,6 +2240,8 @@ llm_graph_params llama_context::graph_params(
         /*.cross       =*/ &cross,
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,
+        /*.mtp_layer_idx =*/ mtp_layer_idx,
+        /*.mtp_tree_verify =*/ mtp_tree_verify,
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,
     };
@@ -3139,6 +3217,424 @@ void llama_set_warmup(llama_context * ctx, bool warmup) {
     ctx->set_warmup(warmup);
 }
 
+ggml_tensor * llama_context::get_t_h_pre_norm() const {
+    return gf_res_prev ? gf_res_prev->t_h_pre_norm : nullptr;
+}
+
+ggml_tensor * llama_context_get_t_h_pre_norm(struct llama_context * ctx) {
+    return ctx ? ctx->get_t_h_pre_norm() : nullptr;
+}
+
+ggml_tensor * llama_context::get_t_mtp_out() const {
+    return gf_res_prev ? gf_res_prev->t_mtp_out : nullptr;
+}
+
+ggml_tensor * llama_context_get_t_mtp_out(struct llama_context * ctx) {
+    return ctx ? ctx->get_t_mtp_out() : nullptr;
+}
+
+void llama_set_mtp(struct llama_context * ctx_target, struct llama_context * ctx_mtp) {
+    if (!ctx_target) {
+        return;
+    }
+    ctx_target->set_mtp(ctx_mtp);
+}
+
+void llama_set_mtps(struct llama_context * ctx_target, struct llama_context ** ctxs_mtp, int32_t n_ctxs_mtp) {
+    if (!ctx_target) {
+        return;
+    }
+
+    std::vector<llama_context *> ctxs;
+    if (ctxs_mtp != nullptr && n_ctxs_mtp > 0) {
+        ctxs.assign(ctxs_mtp, ctxs_mtp + n_ctxs_mtp);
+    }
+    ctx_target->set_mtps(ctxs);
+}
+
+void llama_context::set_mtp_layer_idx(int32_t il) {
+    mtp_layer_idx = il;
+}
+
+void llama_set_mtp_layer_idx(struct llama_context * ctx_mtp, int32_t il) {
+    if (!ctx_mtp) {
+        return;
+    }
+    ctx_mtp->set_mtp_layer_idx(il);
+}
+
+bool llama_context::set_mtp_tree_verify(
+        const int32_t * parents,
+        const int32_t * depths,
+              int32_t   n_nodes,
+              int32_t   n_steps,
+              int32_t   top_k) {
+    clear_mtp_tree_verify();
+
+    if (n_nodes <= 0) {
+        return true;
+    }
+
+    if (parents == nullptr) {
+        LLAMA_LOG_ERROR("%s: parents must not be null when n_nodes > 0\n", __func__);
+        return false;
+    }
+
+    mtp_tree_verify_pending.nodes.resize(n_nodes);
+    mtp_tree_verify_pending.n_steps = n_steps;
+    mtp_tree_verify_pending.top_k   = top_k;
+
+    for (int32_t i = 0; i < n_nodes; ++i) {
+        const int32_t parent = parents[i];
+        if (parent < -1 || parent >= i) {
+            LLAMA_LOG_ERROR("%s: invalid parent at node %d: %d\n", __func__, i, parent);
+            clear_mtp_tree_verify();
+            return false;
+        }
+
+        const int32_t inferred_depth = parent < 0 ? 0 : mtp_tree_verify_pending.nodes[parent].depth + 1;
+        const int32_t depth = depths ? depths[i] : inferred_depth;
+
+        if (depth < 0 || (parent >= 0 && depth <= mtp_tree_verify_pending.nodes[parent].depth)) {
+            LLAMA_LOG_ERROR("%s: invalid depth at node %d: %d\n", __func__, i, depth);
+            clear_mtp_tree_verify();
+            return false;
+        }
+
+        mtp_tree_verify_pending.nodes[i].parent = parent;
+        mtp_tree_verify_pending.nodes[i].depth  = depth;
+    }
+
+    mtp_tree_verify_pending_set = true;
+    return true;
+}
+
+void llama_context::clear_mtp_tree_verify() {
+    if (mtp_tree_verify_pending_set) {
+        mtp_tree_verify_last = mtp_tree_verify_pending;
+    }
+    mtp_tree_verify_pending = {};
+    mtp_tree_verify_pending_set = false;
+}
+
+bool llama_context::commit_mtp_tree_verify(
+        const int32_t * keep_rows,
+              int32_t   n_keep_rows) {
+    if (keep_rows == nullptr || n_keep_rows <= 0) {
+        return true;
+    }
+
+    if (mtp_tree_verify_last.empty()) {
+        LLAMA_LOG_WARN("%s: no completed MTP tree verify descriptor is available\n", __func__);
+        return false;
+    }
+
+    auto * mem_iswa = dynamic_cast<llama_kv_cache_iswa *>(memory.get());
+    if (mem_iswa == nullptr) {
+        LLAMA_LOG_WARN("%s: packed MTP tree commit currently supports only iSWA KV memory\n", __func__);
+        return false;
+    }
+
+    std::vector<int32_t> rows(keep_rows, keep_rows + n_keep_rows);
+    return mem_iswa->seq_commit_cells(
+            /*seq_id_src =*/ 1,
+            /*seq_id_dst =*/ 0,
+            mtp_tree_verify_last.kv_idxs_base,
+            mtp_tree_verify_last.kv_idxs_swa,
+            rows);
+}
+
+bool llama_set_mtp_tree_verify(
+        struct llama_context * ctx,
+        const int32_t * parents,
+        const int32_t * depths,
+        int32_t n_nodes,
+        int32_t n_steps,
+        int32_t top_k) {
+    if (!ctx) {
+        return false;
+    }
+    return ctx->set_mtp_tree_verify(parents, depths, n_nodes, n_steps, top_k);
+}
+
+
+void llama_mtp_flush(struct llama_context * ctx) {
+    if (ctx) {
+        ctx->mtp_flush();
+    }
+}
+
+void llama_context::mtp_flush() {
+    if (!mtp.ctx_mtp || mtp.prefill_tokens.empty()) {
+        return;
+    }
+
+    const int64_t n_embd = model.hparams.n_embd;
+    const size_t total = mtp.prefill_tokens.size();
+    size_t offset = 0;
+
+    const uint32_t n_mtp_prefill = mtp.ctxs_mtp.empty() ? 1 : (uint32_t) mtp.ctxs_mtp.size();
+    
+    // Check LLAMA_MIMO_MTP_PREFILL_LAYERS
+    uint32_t n_mtp_prefill_actual = n_mtp_prefill;
+    if (const char * env = std::getenv("LLAMA_MIMO_MTP_PREFILL_LAYERS")) {
+        const uint32_t n_mtp_layers = std::max<uint32_t>(1, mtp.ctx_mtp->model.hparams.nextn_predict_layers);
+        n_mtp_prefill_actual = std::max<uint32_t>(1, std::min<uint32_t>(n_mtp_layers, (uint32_t) std::atoi(env)));
+    }
+
+    while (offset < total) {
+        const size_t chunk = std::min<size_t>(total - offset, cparams.n_ubatch);
+        
+        for (size_t i = 0; i < chunk; ++i) {
+            std::memcpy(mtp.hook_batch.embd + i * n_embd,
+                        mtp.prefill_h.data() + (offset + i) * n_embd,
+                        n_embd * sizeof(float));
+            mtp.hook_batch.token[i]     = mtp.prefill_tokens[offset + i];
+            mtp.hook_batch.pos[i]       = mtp.prefill_pos[offset + i];
+            mtp.hook_batch.n_seq_id[i]  = 1;
+            mtp.hook_batch.seq_id[i][0] = 0;
+            mtp.hook_batch.logits[i]    = 0;
+        }
+        mtp.hook_batch.n_tokens = chunk;
+
+        for (uint32_t i = 0; i < n_mtp_prefill_actual; ++i) {
+            llama_context * ctx_mtp_layer = mtp.ctxs_mtp.empty()
+                ? mtp.ctx_mtp
+                : mtp.ctxs_mtp[std::min<size_t>(i, mtp.ctxs_mtp.size() - 1)];
+            ctx_mtp_layer->set_mtp_layer_idx((int32_t) i);
+            
+            // Pass D2D tensor for token generation (chunk == 1)
+            if (chunk == 1) {
+                ctx_mtp_layer->mtp.pending_t_gpu = mtp.pending_t_gpu;
+            }
+            
+            const int32_t rc_dec = llama_decode(ctx_mtp_layer, mtp.hook_batch);
+            if (rc_dec != 0) {
+                LLAMA_LOG_ERROR("%s: llama_decode(ctx_mtp) failed rc=%d\n", __func__, (int) rc_dec);
+                break;
+            }
+        }
+        mtp.pending_t_gpu = nullptr;
+        offset += chunk;
+    }
+
+    mtp.prefill_tokens.clear();
+    mtp.prefill_pos.clear();
+    mtp.prefill_h.clear();
+}
+
+void llama_clear_mtp_tree_verify(struct llama_context * ctx) {
+    if (!ctx) {
+        return;
+    }
+    ctx->clear_mtp_tree_verify();
+}
+
+bool llama_commit_mtp_tree_verify(
+        struct llama_context * ctx,
+        const int32_t * keep_rows,
+        int32_t n_keep_rows) {
+    if (!ctx) {
+        return false;
+    }
+    return ctx->commit_mtp_tree_verify(keep_rows, n_keep_rows);
+}
+
+void llama_context::set_mtp(llama_context * ctx_mtp_in) {
+    std::vector<llama_context *> ctxs;
+    if (ctx_mtp_in != nullptr) {
+        ctxs.push_back(ctx_mtp_in);
+    }
+    set_mtps(ctxs);
+}
+
+void llama_context::set_mtps(const std::vector<llama_context *> & ctxs_mtp_in) {
+    llama_context * ctx_mtp_in = ctxs_mtp_in.empty() ? nullptr : ctxs_mtp_in.front();
+    if (mtp.ctx_mtp == ctx_mtp_in && mtp.ctxs_mtp == ctxs_mtp_in) {
+        return;
+    }
+
+    if (mtp.ctx_mtp && std::getenv("LLAMA_MIMO_MTP_HOOK_STATS") != nullptr) {
+        LLAMA_LOG_INFO("%s: MTP hook stats: calls=%" PRIu64 ", skip_bad_shape=%" PRIu64
+                       ", skip_caught_up=%" PRIu64 ", pending_breaks=%" PRIu64
+                       ", gap_deferrals=%" PRIu64 ", decode_batches=%" PRIu64
+                       ", decode_rows=%" PRIu64 ", decode_calls=%" PRIu64
+                       ", decode_failures=%" PRIu64 "\n",
+                       __func__,
+                       mtp.hook_calls,
+                       mtp.hook_skip_bad_shape,
+                       mtp.hook_skip_caught_up,
+                       mtp.hook_pending_breaks,
+                       mtp.hook_gap_deferrals,
+                       mtp.hook_decode_batches,
+                       mtp.hook_decode_rows,
+                       mtp.hook_decode_calls,
+                       mtp.hook_decode_failures);
+    }
+
+    if (mtp.hook_batch.pos != nullptr) {
+        llama_batch_free(mtp.hook_batch);
+        mtp.hook_batch = llama_batch{};
+    }
+
+    mtp.ctx_mtp     = ctx_mtp_in;
+    mtp.ctxs_mtp    = ctxs_mtp_in;
+    mtp.pending_pos = -1;
+    mtp.hook_calls           = 0;
+    mtp.hook_skip_bad_shape  = 0;
+    mtp.hook_skip_caught_up  = 0;
+    mtp.hook_pending_breaks  = 0;
+    mtp.hook_gap_deferrals   = 0;
+    mtp.hook_decode_batches  = 0;
+    mtp.hook_decode_rows     = 0;
+    mtp.hook_decode_calls    = 0;
+    mtp.hook_decode_failures = 0;
+
+    if (mtp.ctx_mtp) {
+        const int32_t n_ub   = (int32_t) cparams.n_ubatch;
+        const int32_t n_embd = (int32_t) model.hparams.n_embd;
+        mtp.hook_batch       = llama_batch_init(n_ub, n_embd, 1);
+        mtp.hook_batch.token = (llama_token *) malloc(sizeof(llama_token) * n_ub);
+        mtp.pending_h.assign(n_embd, 0.0f);
+        mtp.prefill_h.clear();
+        mtp.prefill_tokens.clear();
+        mtp.prefill_pos.clear();
+        LLAMA_LOG_INFO("%s: MTP draft head registered (n_ctxs=%zu, ctx_mtp=%p, n_ubatch=%d, n_embd=%d)\n",
+                       __func__, mtp.ctxs_mtp.size(), (const void *) mtp.ctx_mtp, n_ub, n_embd);
+    } else {
+        mtp.ctxs_mtp.clear();
+        mtp.pending_h.clear();
+        mtp.pending_h.shrink_to_fit();
+        mtp.prefill_h.clear();
+        mtp.prefill_h.shrink_to_fit();
+        mtp.prefill_tokens.clear();
+        mtp.prefill_tokens.shrink_to_fit();
+        mtp.prefill_pos.clear();
+        mtp.prefill_pos.shrink_to_fit();
+        LLAMA_LOG_INFO("%s: MTP draft head unregistered\n", __func__);
+    }
+}
+
+void llama_context::handle_mtp_for_ubatch(
+        int32_t                n_tokens,
+        const llama_token    * tokens,
+        const llama_pos      * positions,
+        struct ggml_tensor   * t) {
+    if (n_tokens == 0 || tokens == nullptr || positions == nullptr || t == nullptr || mtp.ctx_mtp == nullptr) {
+        return;
+    }
+    const bool hook_trace = std::getenv("LLAMA_MIMO_MTP_HOOK_TRACE") != nullptr;
+    mtp.hook_calls++;
+    if (t->ne[1] != (int64_t) n_tokens) {
+        mtp.hook_skip_bad_shape++;
+        if (hook_trace) {
+            LLAMA_LOG_INFO("%s: MTP hook trace: action=skip_bad_shape n_tokens=%d h_rows=%d\n",
+                           __func__, n_tokens, (int) t->ne[1]);
+        }
+        return;
+    }
+
+    const int64_t n_embd = model.hparams.n_embd;
+    GGML_ASSERT(t->ne[0] == n_embd);
+
+    const int       n_rows    = (int) n_tokens;
+    const llama_pos pos_start = positions[0];
+
+    const llama_pos pos_max_mtp = llama_memory_seq_pos_max(llama_get_memory(mtp.ctx_mtp), 0);
+    if (pos_start <= pos_max_mtp) {
+        mtp.hook_skip_caught_up++;
+        if (hook_trace) {
+            LLAMA_LOG_INFO("%s: MTP hook trace: action=skip_caught_up n_rows=%d pos_start=%d pos_end=%d pos_max_mtp=%d pending_pos=%d\n",
+                           __func__, n_rows, (int) pos_start, (int) positions[n_rows - 1],
+                           (int) pos_max_mtp, (int) mtp.pending_pos);
+        }
+        return;
+    }
+
+    const bool pending_continues = mtp.pending_pos >= 0 && mtp.pending_pos + 1 == pos_start;
+    if (mtp.pending_pos >= 0 && !pending_continues) {
+        mtp.hook_pending_breaks++;
+        if (hook_trace) {
+            LLAMA_LOG_INFO("%s: MTP hook trace: action=pending_break pending_pos=%d pos_start=%d\n",
+                           __func__, (int) mtp.pending_pos, (int) pos_start);
+        }
+        mtp.pending_pos = -1;
+    }
+
+    synchronize();
+
+    const size_t row_bytes = (size_t) n_embd * sizeof(float);
+    // Each MTP prefill row is (hidden at position p - 1, token at position p).
+    // The last target hidden row has no following token in this ubatch, so keep
+    // it pending for the next contiguous target token.
+    const int    n_out     = (pending_continues ? 1 : 0) + (n_rows - 1);
+
+    if (n_out > 0) {
+        const llama_pos first_out_pos = pending_continues ? pos_start : positions[1];
+        if (pos_max_mtp >= 0 && first_out_pos != pos_max_mtp + 1) {
+            mtp.hook_gap_deferrals++;
+            if (hook_trace) {
+                LLAMA_LOG_INFO("%s: MTP hook trace: action=gap_defer n_rows=%d first_out_pos=%d pos_max_mtp=%d save_pending_pos=%d\n",
+                               __func__, n_rows, (int) first_out_pos, (int) pos_max_mtp,
+                               (int) (pos_start + n_rows - 1));
+            }
+            // We cannot fill the gap in this call, but the final hidden row may
+            // still become useful if the next ubatch is contiguous from here.
+            ggml_backend_tensor_get(t, mtp.pending_h.data(),
+                (size_t) (n_rows - 1) * row_bytes, row_bytes);
+            mtp.pending_pos = pos_start + n_rows - 1;
+            return;
+        }
+
+        if (pending_continues) {
+            if (n_rows == 1) {
+                // Token generation (1 token): D2D shortcut
+                mtp.pending_t_gpu = t;
+                const size_t old_size = mtp.prefill_h.size();
+                mtp.prefill_h.resize(old_size + n_embd); // dummy values
+                mtp.prefill_tokens.push_back(tokens[0]);
+                mtp.prefill_pos.push_back(pos_start);
+            } else {
+                mtp.prefill_h.insert(mtp.prefill_h.end(), mtp.pending_h.begin(), mtp.pending_h.end());
+                mtp.prefill_tokens.push_back(tokens[0]);
+                mtp.prefill_pos.push_back(pos_start);
+            }
+        }
+
+        if (n_rows > 1) {
+            const size_t old_size = mtp.prefill_h.size();
+            mtp.prefill_h.resize(old_size + (n_rows - 1) * n_embd);
+            ggml_backend_tensor_get(t, mtp.prefill_h.data() + old_size, 0, (n_rows - 1) * row_bytes);
+            
+            for (int k = 0; k + 1 < n_rows; ++k) {
+                mtp.prefill_tokens.push_back(tokens[k + 1]);
+                mtp.prefill_pos.push_back(positions[k + 1]);
+            }
+        }
+        
+        mtp.hook_decode_batches++;
+        mtp.hook_decode_rows += (uint64_t) n_out;
+        if (hook_trace) {
+            LLAMA_LOG_INFO("%s: MTP hook trace: action=batch_prefill n_rows=%d n_out=%d first_out_pos=%d pos_start=%d pos_end=%d pos_max_mtp=%d pending_continues=%d n_prefill_ctxs=%zu\n",
+                           __func__, n_rows, n_out, (int) first_out_pos, (int) pos_start,
+                           (int) positions[n_rows - 1], (int) pos_max_mtp,
+                           pending_continues ? 1 : 0,
+                           mtp.ctxs_mtp.empty() ? (size_t) 1 : mtp.ctxs_mtp.size());
+        }
+        
+        // Prevent OOM if generation is disabled or draft() isn't called
+        if (mtp.prefill_tokens.size() >= 8192) {
+            mtp_flush();
+        }
+    }
+
+    if (n_rows > 1) {
+        ggml_backend_tensor_get(t, mtp.pending_h.data(),
+            (size_t) (n_rows - 1) * row_bytes, row_bytes);
+    }
+    mtp.pending_pos = pos_start + n_rows - 1;
+}
+
 void llama_synchronize(llama_context * ctx) {
     ctx->synchronize();
 }
@@ -3294,6 +3790,36 @@ bool llama_memory_seq_rm(
     }
 
     return mem->seq_rm(seq_id, p0, p1);
+}
+
+bool llama_context_seq_rm(
+        llama_context * ctx,
+          llama_seq_id seq_id,
+             llama_pos p0,
+             llama_pos p1) {
+    if (!ctx) {
+        return true;
+    }
+
+    const bool ok = llama_memory_seq_rm(llama_get_memory(ctx), seq_id, p0, p1);
+
+    const auto & ctxs_mtp = ctx->get_mtps();
+    if (!ctxs_mtp.empty()) {
+        for (size_t i = 0; i < ctxs_mtp.size(); ++i) {
+            llama_context * ctx_mtp = ctxs_mtp[i];
+            if (!llama_memory_seq_rm(llama_get_memory(ctx_mtp), 0, p0, p1)) {
+                LLAMA_LOG_WARN("%s: failed to mirror seq_rm to MTP context %zu (p0=%d, p1=%d)\n",
+                        __func__, i, (int) p0, (int) p1);
+            }
+        }
+    } else if (llama_context * ctx_mtp = ctx->get_mtp()) {
+        if (!llama_memory_seq_rm(llama_get_memory(ctx_mtp), 0, p0, p1)) {
+            LLAMA_LOG_WARN("%s: failed to mirror seq_rm to MTP context (p0=%d, p1=%d)\n",
+                    __func__, (int) p0, (int) p1);
+        }
+    }
+
+    return ok;
 }
 
 void llama_memory_seq_cp(

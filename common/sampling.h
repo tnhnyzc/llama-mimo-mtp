@@ -85,6 +85,10 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
 // assume idxs == [ 0, 1, 2, ..., draft.size() ]
 std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const llama_tokens & draft, bool grammar_first = false);
 
+// p/q acceptance: uses draft probabilities q(x) for speculative decoding acceptance
+// when draft_probs is empty or temperature <= 0, falls back to exact match
+std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, const std::vector<float> & draft_probs, float accept_bias = 1.0f, const std::vector<std::vector<float>> * draft_logits = nullptr, float logit_blend = 0.0f, const std::vector<std::vector<float>> * draft_probs_all = nullptr, bool grammar_first = false, float garbage_thresh = 0.0f, float dist_restore = 0.0f);
+
 uint32_t common_sampler_get_seed(const struct common_sampler * gsmpl);
 
 // helpers

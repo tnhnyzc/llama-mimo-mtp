@@ -20,6 +20,7 @@ struct llama_cparams;
 struct llama_layer;
 
 struct llama_memory_context_i;
+struct llama_mtp_tree_verify;
 
 class llama_kv_cache_context;
 class llama_kv_cache_iswa_context;
@@ -360,10 +361,12 @@ public:
     llm_graph_input_attn_kv_iswa(
             const llama_hparams & hparams,
             const llama_cparams & cparams,
-            const llama_kv_cache_iswa_context * mctx) :
+            const llama_kv_cache_iswa_context * mctx,
+            const llama_mtp_tree_verify * mtp_tree_verify = nullptr) :
         hparams(hparams),
         cparams(cparams),
-        mctx(mctx) {
+        mctx(mctx),
+        mtp_tree_verify(mtp_tree_verify) {
     }
     ~llm_graph_input_attn_kv_iswa() = default;
 
@@ -399,6 +402,7 @@ public:
     const llama_cparams cparams;
 
     const llama_kv_cache_iswa_context * mctx;
+    const llama_mtp_tree_verify * mtp_tree_verify;
 };
 
 class llm_graph_input_attn_cross : public llm_graph_input_i {
@@ -563,6 +567,8 @@ struct llm_graph_params {
     }
 
     uint32_t n_outputs;
+    int32_t mtp_layer_idx = -1;
+    const llama_mtp_tree_verify * mtp_tree_verify = nullptr;
 
     llm_graph_cb cb;
 
@@ -602,6 +608,14 @@ struct llm_graph_params {
         }
 
         if (n_outputs != other.n_outputs) {
+            return false;
+        }
+
+        if (mtp_layer_idx != other.mtp_layer_idx) {
+            return false;
+        }
+
+        if ((mtp_tree_verify != nullptr) != (other.mtp_tree_verify != nullptr)) {
             return false;
         }
 
@@ -645,6 +659,8 @@ public:
     ggml_tensor * get_embd()        const { return t_embd; }
     ggml_tensor * get_embd_pooled() const { return t_embd_pooled; }
 
+    ggml_tensor * get_h_pre_norm() const { return t_h_pre_norm; }
+
     ggml_cgraph  * get_gf()  const { return gf; }
     ggml_context * get_ctx() const { return ctx_compute.get(); }
 
@@ -672,6 +688,10 @@ public:
     ggml_tensor * t_logits      = nullptr;
     ggml_tensor * t_embd        = nullptr;
     ggml_tensor * t_embd_pooled = nullptr;
+
+    // MTP related inputs/outputs
+    ggml_tensor * t_h_pre_norm  = nullptr; // [n_embd, n_outputs] hidden state required for MTP
+    ggml_tensor * t_mtp_out     = nullptr; // [n_embd, n_tokens]
 
     std::map<llama_seq_id, ggml_tensor*> t_sampled_logits;
     std::map<llama_seq_id, ggml_tensor*> t_candidates;
@@ -758,6 +778,7 @@ struct llm_graph_context {
     const llama_adapter_loras    * loras;
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
+    const llama_mtp_tree_verify  * mtp_tree_verify;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 

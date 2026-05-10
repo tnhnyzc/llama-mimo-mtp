@@ -3499,6 +3499,66 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_MIN"));
 
     add_opt(common_arg(
+        {"--spec-calib-temp"}, "F",
+        string_format("draft calibration temperature scaling (default: %.2f, >1 = less overconfident)", params.speculative.calib_temp),
+        [](common_params & params, const std::string & value) {
+            float v = std::stof(value);
+            if (v <= 0.0f) {
+                throw std::invalid_argument("must be > 0");
+            }
+            params.speculative.calib_temp = v;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_CALIB_TEMP"));
+
+    add_opt(common_arg(
+        {"--spec-accept-bias"}, "F",
+        string_format("p/q acceptance bias (default: %.2f, >1 = trust draft more, <1 = trust target more)", params.speculative.accept_bias),
+        [](common_params & params, const std::string & value) {
+            float v = std::stof(value);
+            if (v <= 0.0f) {
+                throw std::invalid_argument("must be > 0");
+            }
+            params.speculative.accept_bias = v;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_ACCEPT_BIAS"));
+
+    add_opt(common_arg(
+        {"--spec-logit-blend"}, "F",
+        string_format("blend draft logits into target for p/q acceptance (default: %.2f, >0 = use draft signal to correct target)", params.speculative.logit_blend),
+        [](common_params & params, const std::string & value) {
+            float v = std::stof(value);
+            if (v < 0.0f) {
+                throw std::invalid_argument("must be >= 0");
+            }
+            params.speculative.logit_blend = v;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_LOGIT_BLEND"));
+
+    add_opt(common_arg(
+        {"--spec-garbage-thresh"}, "F",
+        string_format("reject draft tokens where MTP q(x) < threshold (default: %.3f, 0 = disabled)", params.speculative.garbage_thresh),
+        [](common_params & params, const std::string & value) {
+            float v = std::stof(value);
+            if (v < 0.0f) {
+                throw std::invalid_argument("must be >= 0");
+            }
+            params.speculative.garbage_thresh = v;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_GARBAGE_THRESH"));
+
+    add_opt(common_arg(
+        {"--spec-dist-restore"}, "F",
+        string_format("blend MTP probability distribution into target after softmax (default: %.2f, 0 = disabled)", params.speculative.dist_restore),
+        [](common_params & params, const std::string & value) {
+            float v = std::stof(value);
+            if (v < 0.0f || v > 1.0f) {
+                throw std::invalid_argument("must be in [0, 1]");
+            }
+            params.speculative.dist_restore = v;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_DIST_RESTORE"));
+
+    add_opt(common_arg(
         {"--spec-draft-p-split", "--draft-p-split"}, "P",
         string_format("speculative decoding split probability (default: %.2f)", (double)params.speculative.draft.p_split),
         [](common_params & params, const std::string & value) {
@@ -3562,12 +3622,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
-        {"--spec-type"}, "[none|ngram-cache|ngram-simple|ngram-map-k|ngram-map-k4v|ngram-mod]",
+        {"--spec-type"}, "[none|mtp|ngram-cache|ngram-simple|ngram-map-k|ngram-map-k4v|ngram-mod]",
         string_format("type of speculative decoding to use when no draft model is provided (default: %s)\n",
             common_speculative_type_to_str(params.speculative.type).c_str()),
         [](common_params & params, const std::string & value) {
             if (value == "none") {
                 params.speculative.type = COMMON_SPECULATIVE_TYPE_NONE;
+            } else if (value == "mtp") {
+                params.speculative.type = COMMON_SPECULATIVE_TYPE_MTP;
             } else if (value == "ngram-cache") {
                 params.speculative.type = COMMON_SPECULATIVE_TYPE_NGRAM_CACHE;
             } else if (value == "ngram-simple") {

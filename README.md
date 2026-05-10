@@ -10,6 +10,10 @@
 
 LLM inference in C/C++
 
+## Fork Note
+
+Experimental same-GGUF MTP speculative decoding for MiMo-V2.5. Tested on Apple Silicon only, dGPU benchmarks welcome. See [README_MIMO_MTP.md](README_MIMO_MTP.md).
+
 ## Recent API changes
 
 - [Changelog for `libllama` API](https://github.com/ggml-org/llama.cpp/issues/9289)

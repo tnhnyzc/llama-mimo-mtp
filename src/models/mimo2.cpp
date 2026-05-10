@@ -9,9 +9,27 @@ void llama_model_mimo2::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_SLIDING_WINDOW,   hparams.n_swa);
     ml.get_key(LLM_KV_ROPE_FREQ_BASE_SWA,         hparams.rope_freq_base_train_swa, false);
     ml.get_key(LLM_KV_ATTENTION_VALUE_SCALE,      hparams.f_attn_value_scale, false);
+    ml.get_key(LLM_KV_NEXTN_PREDICT_LAYERS,       hparams.nextn_predict_layers, false);
+    GGML_ASSERT(hparams.nextn_predict_layers < hparams.n_layer && "nextn_predict_layers must be < n_layer");
+    hparams.n_layer_kv_from_start = hparams.n_layer - hparams.nextn_predict_layers;
     ml.get_key_or_arr(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, hparams.swa_layers, hparams.n_layer);
+    if (hparams.nextn_predict_layers > 0) {
+        const uint32_t n_main = hparams.n_layer - hparams.nextn_predict_layers;
+        uint32_t n_head_kv_swa = hparams.n_head_kv_arr[n_main > 0 ? n_main - 1 : 0];
+        for (uint32_t i = 0; i < n_main; ++i) {
+            if (hparams.swa_layers[i]) {
+                n_head_kv_swa = std::max(n_head_kv_swa, hparams.n_head_kv_arr[i]);
+            }
+        }
+        for (uint32_t i = n_main; i < hparams.n_layer; ++i) {
+            hparams.swa_layers[i]    = 1;
+            hparams.n_head_arr[i]    = hparams.n_head_arr[0];
+            hparams.n_head_kv_arr[i] = n_head_kv_swa;
+            hparams.n_ff_arr[i]      = hparams.n_ff_arr[0];
+        }
+    }
 
-    switch (hparams.n_layer) {
+    switch (hparams.n_layer - hparams.nextn_predict_layers) {
         case 48: type = LLM_TYPE_310B_A15B; break;
         default: type = LLM_TYPE_UNKNOWN;
     }
@@ -52,6 +70,15 @@ void llama_model_mimo2::load_arch_tensors(llama_model_loader &) {
         layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {n_ff_exp,   n_embd, n_expert}, TENSOR_NOT_REQUIRED);
         layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), {n_embd, n_ff_exp,   n_expert}, TENSOR_NOT_REQUIRED);
         layer.ffn_exp_probs_b = create_tensor(tn(LLM_TENSOR_FFN_EXP_PROBS_B, "bias", i), {n_expert}, TENSOR_NOT_REQUIRED);
+
+        if (hparams.nextn_predict_layers > 0 && static_cast<uint32_t>(i) >= n_layer - hparams.nextn_predict_layers) {
+            layer.nextn.eh_proj          = create_tensor(tn(LLM_TENSOR_NEXTN_EH_PROJ,          "weight", i), {2 * n_embd, n_embd}, TENSOR_NOT_REQUIRED);
+            layer.nextn.enorm            = create_tensor(tn(LLM_TENSOR_NEXTN_ENORM,            "weight", i), {n_embd},             TENSOR_NOT_REQUIRED);
+            layer.nextn.hnorm            = create_tensor(tn(LLM_TENSOR_NEXTN_HNORM,            "weight", i), {n_embd},             TENSOR_NOT_REQUIRED);
+            layer.nextn.embed_tokens     = create_tensor(tn(LLM_TENSOR_NEXTN_EMBED_TOKENS,     "weight", i), {n_embd, n_vocab},    TENSOR_NOT_REQUIRED);
+            layer.nextn.shared_head_head = create_tensor(tn(LLM_TENSOR_NEXTN_SHARED_HEAD_HEAD, "weight", i), {n_embd, n_vocab},    TENSOR_NOT_REQUIRED);
+            layer.nextn.shared_head_norm = create_tensor(tn(LLM_TENSOR_NEXTN_SHARED_HEAD_NORM, "weight", i), {n_embd},             TENSOR_NOT_REQUIRED);
+        }
     }
 }
 
@@ -70,8 +97,9 @@ llama_model_mimo2::graph::graph(const llama_model & model, const llm_graph_param
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
     const float v_scale = hparams.f_attn_value_scale;
+    const int n_transformer_layers = n_layer - hparams.nextn_predict_layers;
 
-    for (int il = 0; il < n_layer; ++il) {
+    for (int il = 0; il < n_transformer_layers; ++il) {
         ggml_tensor * inpSA = inpL;
 
         uint32_t n_head_l    = hparams.n_head(il);
@@ -149,7 +177,7 @@ llama_model_mimo2::graph::graph(const llama_model & model, const llm_graph_param
             }
         }
 
-        if (il == n_layer - 1 && inp_out_ids) {
+        if (il == n_transformer_layers - 1 && inp_out_ids) {
             cur   = ggml_get_rows(ctx0,   cur, inp_out_ids);
             inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
         }
@@ -198,6 +226,11 @@ llama_model_mimo2::graph::graph(const llama_model & model, const llm_graph_param
     }
 
     cur = inpL;
+
+    if (hparams.nextn_predict_layers > 0) {
+        cb(cur, "h_pre_norm", -1);
+        res->t_h_pre_norm = cur;
+    }
 
     cur = build_norm(cur,
             model.output_norm, NULL,

@@ -106,6 +106,18 @@ void llama_kv_cache_iswa::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p
     kv_swa ->seq_div(seq_id, p0, p1, d);
 }
 
+bool llama_kv_cache_iswa::seq_commit_cells(
+        llama_seq_id seq_id_src,
+        llama_seq_id seq_id_dst,
+        const std::vector<int64_t> & all_idxs_base,
+        const std::vector<int64_t> & all_idxs_swa,
+        const std::vector<int32_t> & keep_rows) {
+    const bool ok_base = kv_base->seq_commit_cells(seq_id_src, seq_id_dst, all_idxs_base, keep_rows);
+    const bool ok_swa  = kv_swa ->seq_commit_cells(seq_id_src, seq_id_dst, all_idxs_swa,  keep_rows);
+
+    return ok_base && ok_swa;
+}
+
 llama_pos llama_kv_cache_iswa::seq_pos_min(llama_seq_id seq_id) const {
     // the base cache is a superset of the SWA cache, so we can just check the SWA cache
     return kv_swa->seq_pos_min(seq_id);

@@ -117,7 +117,8 @@ class ModelBase:
                  small_first_shard: bool = False, hparams: dict[str, Any] | None = None, remote_hf_model_id: str | None = None,
                  disable_mistral_community_chat_template: bool = False,
                  sentence_transformers_dense_modules: bool = False,
-                 fuse_gate_up_exps: bool = False):
+                 fuse_gate_up_exps: bool = False,
+                 mimo_mtp_layers: int | None = None):
         if type(self) is ModelBase or \
                 type(self) is TextModel or \
                 type(self) is MmprojModel:
@@ -137,6 +138,7 @@ class ModelBase:
         self.remote_hf_model_id = remote_hf_model_id
         self.sentence_transformers_dense_modules = sentence_transformers_dense_modules
         self.fuse_gate_up_exps = fuse_gate_up_exps
+        self.mimo_mtp_layers = mimo_mtp_layers
         self._gate_exp_buffer: dict[int, Tensor] = {}
         self._up_exp_buffer: dict[int, Tensor] = {}
         self.hparams = ModelBase.load_hparams(self.dir_model, self.is_mistral_format) if hparams is None else hparams
@@ -9323,8 +9325,89 @@ class MiniMaxM2Model(TextModel):
         yield from super().modify_tensors(data_torch, name, bid)
 
 
+
+class _MimoV2MtpMixin:
+    hparams: dict[str, Any]
+    gguf_writer: gguf.GGUFWriter
+    block_count: int
+    tensor_map: gguf.TensorNameMap
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        mtp_layers = self._detect_mtp_layers()
+        if self.mimo_mtp_layers is not None:
+            if self.mimo_mtp_layers < 0:
+                raise ValueError("--mimo-mtp-layers must be >= 0")
+            mtp_layers = min(mtp_layers, self.mimo_mtp_layers)
+        self.hparams["_mtp_num_layers"] = mtp_layers
+        self.block_count = self.hparams["num_hidden_layers"] + mtp_layers
+        self.tensor_map = gguf.get_tensor_name_map(self.model_arch, self.block_count)
+
+    def _detect_mtp_layers(self) -> int:
+        n_layer = self.hparams["num_hidden_layers"]
+        max_idx = -1
+        for name in list(self.model_tensors.keys()):
+            if name.startswith("model.mtp.layers."):
+                parts = name.split(".")
+                if len(parts) >= 4 and parts[3].isdigit():
+                    idx = int(parts[3])
+                    if idx > max_idx:
+                        max_idx = idx
+        return max_idx + 1 if max_idx >= 0 else 0
+
+    def set_gguf_parameters(self):
+        super().set_gguf_parameters()
+        if (n := self.hparams.get("_mtp_num_layers", 0)) > 0:
+            self.gguf_writer.add_nextn_predict_layers(n)
+
+    def modify_tensors(self, data_torch, name, bid):
+        if name.startswith("model.mtp."):
+            n_layer = self.hparams["num_hidden_layers"]
+            mtp_layers = self.hparams.get("_mtp_num_layers", 0)
+            if mtp_layers <= 0:
+                return
+            if "mtp.layers." in name:
+                assert bid is not None
+                if bid >= mtp_layers:
+                    return
+                out_bid = bid + n_layer
+                if name.endswith(".eh_proj.weight"):
+                    name = self.format_tensor_name(gguf.MODEL_TENSOR.NEXTN_EH_PROJ, out_bid)
+                elif name.endswith(".enorm.weight"):
+                    name = self.format_tensor_name(gguf.MODEL_TENSOR.NEXTN_ENORM, out_bid)
+                elif name.endswith(".hnorm.weight"):
+                    name = self.format_tensor_name(gguf.MODEL_TENSOR.NEXTN_HNORM, out_bid)
+                elif name.endswith(".final_layernorm.weight"):
+                    name = self.format_tensor_name(gguf.MODEL_TENSOR.NEXTN_SHARED_HEAD_NORM, out_bid)
+                else:
+                    name = name.replace(f"model.mtp.layers.{bid}", f"model.layers.{out_bid}")
+            else:
+                remapper = {
+                    "model.mtp.fc":                    "blk.{bid}.nextn.eh_proj",
+                    "model.mtp.pre_fc_norm_embedding": "blk.{bid}.nextn.enorm",
+                    "model.mtp.pre_fc_norm_hidden":    "blk.{bid}.nextn.hnorm",
+                    "model.mtp.norm":                  "blk.{bid}.nextn.shared_head_norm",
+                }
+                matched = False
+                for prefix, tmpl in remapper.items():
+                    if name.startswith(prefix):
+                        stem = name[len("model.mtp."):]
+                        suffix = ""
+                        if "." in stem:
+                            suffix = "." + stem.split(".", 1)[1]
+                        full_tmpl = tmpl + suffix
+                        for b in range(n_layer, self.block_count):
+                            yield from super().modify_tensors(data_torch, full_tmpl.format(bid=b), b)
+                        matched = True
+                        break
+                if not matched:
+                    return
+                return
+        yield from super().modify_tensors(data_torch, name, bid)
+
+
 @ModelBase.register("MiMoV2FlashForCausalLM", "MiMoV2ForCausalLM")
-class MimoV2Model(TextModel):
+class MimoV2Model(_MimoV2MtpMixin, TextModel):
     model_arch = gguf.MODEL_ARCH.MIMO2
 
     @staticmethod
@@ -9400,7 +9483,7 @@ class MimoV2Model(TextModel):
         qkv_overrides: dict[str, tuple[Callable, Callable, int]] = {}
         qc = self.hparams.get("quantization_config")
         if isinstance(qc, dict) and qc.get("quant_method") == "fp8":
-            pat = re.compile(r"^model\.layers\.(\d+)\.self_attn\.qkv_proj\.weight_scale_inv$")
+            pat = re.compile(r"^model\.(?:(mtp)\.)?layers\.(\d+)\.self_attn\.qkv_proj\.weight_scale_inv$")
             for name in list(self.model_tensors.keys()):
                 m = pat.match(name)
                 if not m:
@@ -9408,10 +9491,13 @@ class MimoV2Model(TextModel):
                 weight_name = name.removesuffix("_scale_inv")
                 if weight_name not in self.model_tensors:
                     continue
+                bid = int(m.group(2))
+                if m.group(1) == "mtp":
+                    bid += self.hparams["num_hidden_layers"]
                 qkv_overrides[weight_name] = (
                     self.model_tensors[weight_name],
                     self.model_tensors[name],
-                    int(m.group(1)),
+                    bid,
                 )
 
         super().dequant_model()
@@ -9424,7 +9510,7 @@ class MimoV2Model(TextModel):
         vhd = self.hparams["v_head_dim"]
         hybrid = self.hparams["hybrid_layer_pattern"]
         for weight_name, (w_fn, s_fn, bid) in qkv_overrides.items():
-            is_swa = hybrid[bid] == 1
+            is_swa = bid >= len(hybrid) or hybrid[bid] == 1
             n_kv = self.hparams["swa_num_key_value_heads" if is_swa else "num_key_value_heads"]
             self.model_tensors[weight_name] = (
                 lambda w_fn=w_fn, s_fn=s_fn, n_q=n_q, n_kv=n_kv, hd=hd, vhd=vhd:
@@ -9441,11 +9527,13 @@ class MimoV2Model(TextModel):
 
         n_head_kv = self.hparams["num_key_value_heads"]
         n_head_kv_swa = self.hparams["swa_num_key_value_heads"]
-        n_head_kv_arr = [n_head_kv_swa if use_swa == 1 else n_head_kv for use_swa in self.hparams["hybrid_layer_pattern"]]
+        mtp_layers = self.hparams.get("_mtp_num_layers", 0)
+        hybrid_layer_pattern = list(self.hparams["hybrid_layer_pattern"]) + [1] * mtp_layers
+        n_head_kv_arr = [n_head_kv_swa if use_swa == 1 else n_head_kv for use_swa in hybrid_layer_pattern]
         self.gguf_writer.add_head_count_kv(n_head_kv_arr)
 
         self.gguf_writer.add_sliding_window(self.hparams["sliding_window"])
-        self.gguf_writer.add_sliding_window_pattern(self.hparams["hybrid_layer_pattern"])
+        self.gguf_writer.add_sliding_window_pattern(hybrid_layer_pattern)
         self.gguf_writer.add_value_length(self.hparams["v_head_dim"])
         self.gguf_writer.add_expert_count(self.hparams["n_routed_experts"])
         self.gguf_writer.add_expert_feed_forward_length(self.hparams["moe_intermediate_size"])
@@ -9467,10 +9555,6 @@ class MimoV2Model(TextModel):
 
         if "attention_sink" in name and not name.endswith(".weight"):
             name += ".weight"
-
-        # TODO: mimo v2 does not indicate the number of next-token-prediction layers, therefore we cannot do the same way as GLM4_MOE
-        if "model.mtp." in name:
-            return
 
         # MiMo-V2.5 (non-Pro) ships audio/visual modules we don't run in llama.cpp
         if name.startswith(("audio_encoder.", "visual.", "speech_embeddings.")):
@@ -13557,6 +13641,10 @@ def parse_args() -> argparse.Namespace:
         "--fuse-gate-up-exps", action="store_true",
         help="Fuse gate_exps and up_exps tensors into a single gate_up_exps tensor for MoE models.",
     )
+    parser.add_argument(
+        "--mimo-mtp-layers", type=int, default=None,
+        help="For MiMo-V2 models, limit exported MTP/nextn layers. Use 0 for a normal non-MTP GGUF, 1 for a depth-1 MTP prototype, or omit to export all detected layers.",
+    )
 
     args = parser.parse_args()
     if not args.print_supported_models and args.model is None:
@@ -13702,7 +13790,8 @@ def main() -> None:
                                      small_first_shard=args.no_tensor_first_split,
                                      remote_hf_model_id=hf_repo_id, disable_mistral_community_chat_template=disable_mistral_community_chat_template,
                                      sentence_transformers_dense_modules=args.sentence_transformers_dense_modules,
-                                     fuse_gate_up_exps=args.fuse_gate_up_exps
+                                     fuse_gate_up_exps=args.fuse_gate_up_exps,
+                                     mimo_mtp_layers=args.mimo_mtp_layers,
                                      )
 
         if args.vocab_only:

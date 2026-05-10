@@ -452,11 +452,25 @@ namespace GGUFMeta {
             struct GGUFMeta::ArrayInfo arr_info =
                 GGUFMeta::GKV<GGUFMeta::ArrayInfo>::get_kv(metadata, kid);
 
-            if (n != arr_info.length) {
-                throw std::runtime_error(format("key %s has wrong array length; expected %u, got %u", key.c_str(), n, (uint32_t) arr_info.length));
+            const bool allow_mimo2_mtp_prefix =
+                arch_name == "mimo2" &&
+                (key == "mimo2.attention.head_count" ||
+                 key == "mimo2.attention.head_count_kv" ||
+                 key == "mimo2.feed_forward_length" ||
+                 key == "mimo2.attention.sliding_window_pattern");
+            if ((!allow_mimo2_mtp_prefix && arr_info.length != n) || (allow_mimo2_mtp_prefix && arr_info.length > n)) {
+                throw std::runtime_error(format("key %s has wrong array length; expected %u%s, got %u",
+                    key.c_str(), n, allow_mimo2_mtp_prefix ? " or a shorter MiMo2 MTP prefix" : "", (uint32_t) arr_info.length));
             }
 
-            return get_arr(key, result, required);
+            std::vector<T> values;
+            if (!get_arr(key, values, required)) {
+                return false;
+            }
+            for (size_t i = 0; i < values.size(); ++i) {
+                result[i] = values[i];
+            }
+            return true;
         }
 
         T value;
@@ -1312,9 +1326,16 @@ struct ggml_tensor * llama_model_loader::create_tensor_as_view(struct ggml_conte
     return tensor;
 }
 
-void llama_model_loader::done_getting_tensors() const {
-    if (n_created != n_tensors) {
-        throw std::runtime_error(format("%s: wrong number of tensors; expected %d, got %d", __func__, n_tensors, n_created));
+void llama_model_loader::done_getting_tensors(bool partial) const {
+    if (n_created > n_tensors) {
+        throw std::runtime_error(format("%s: too many tensors created; expected %d, got %d", __func__, n_tensors, n_created));
+    }
+    if (n_created < n_tensors) {
+        if (!partial) {
+            throw std::runtime_error(format("%s: wrong number of tensors; expected %d, got %d", __func__, n_tensors, n_created));
+        }
+        LLAMA_LOG_INFO("%s: partial load - used %d of %d tensors in the file (rest belong to a sibling model on the same .gguf)\n",
+                __func__, n_created, n_tensors);
     }
     if (n_tensors_moved > 0) {
         LLAMA_LOG_DEBUG("%s: tensor '%s' (%s) (and %zu others) cannot be used with preferred buffer type %s, using %s instead\n",

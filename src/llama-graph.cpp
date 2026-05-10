@@ -7,6 +7,7 @@
 
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
+#include "llama-mtp.h"
 #include "llama-memory-hybrid.h"
 #include "llama-memory-hybrid-iswa.h"
 #include "llama-memory-recurrent.h"
@@ -53,6 +54,64 @@ static bool can_reuse_kq_mask(
     res &= (kq_mask->ne[3] == n_stream);
 
     return res;
+}
+
+static bool mtp_tree_is_ancestor(
+        const llama_mtp_tree_verify * tree,
+        int32_t ancestor,
+        int32_t node) {
+    for (int32_t cur = node; cur >= 0;) {
+        if (cur == ancestor) {
+            return true;
+        }
+        if (cur >= (int32_t) tree->nodes.size()) {
+            return false;
+        }
+        cur = tree->nodes[cur].parent;
+    }
+    return false;
+}
+
+static void apply_mtp_tree_kq_mask_overlay(
+        ggml_tensor * kq_mask,
+        ggml_tensor * k_idxs,
+        std::vector<int64_t> * tree_kv_idxs,
+        const llama_mtp_tree_verify * tree) {
+    if (tree == nullptr || tree->empty()) {
+        return;
+    }
+
+    GGML_ASSERT(kq_mask != nullptr);
+    GGML_ASSERT(k_idxs   != nullptr);
+    GGML_ASSERT(ggml_backend_buffer_is_host(kq_mask->buffer));
+    GGML_ASSERT(ggml_backend_buffer_is_host(k_idxs->buffer));
+
+    const int64_t n_kv     = kq_mask->ne[0];
+    const int64_t n_tokens = k_idxs->ne[0];
+    const int64_t n_stream = kq_mask->ne[3];
+
+    GGML_ASSERT(n_stream == 1 && "MTP tree verification overlay only supports packed single-stream batches");
+    GGML_ASSERT((int64_t) tree->nodes.size() == n_tokens);
+
+    float   * mask_data = (float   *) kq_mask->data;
+    int64_t * idx_data  = (int64_t *) k_idxs->data;
+
+    if (tree_kv_idxs != nullptr) {
+        tree_kv_idxs->assign(idx_data, idx_data + n_tokens);
+    }
+
+    for (int64_t q = 0; q < n_tokens; ++q) {
+        for (int64_t k = 0; k < n_tokens; ++k) {
+            const int64_t kv_idx = idx_data[k];
+            if (kv_idx < 0 || kv_idx >= n_kv) {
+                continue;
+            }
+
+            mask_data[n_kv*q + kv_idx] = mtp_tree_is_ancestor(tree, (int32_t) k, (int32_t) q)
+                ? 0.0f
+                : -INFINITY;
+        }
+    }
 }
 
 // impl
@@ -495,15 +554,25 @@ bool llm_graph_input_attn_k::can_reuse(const llm_graph_params & params) {
 }
 
 void llm_graph_input_attn_kv_iswa::set_input(const llama_ubatch * ubatch) {
-    mctx->get_base()->set_input_k_idxs(self_k_idxs, ubatch);
-    mctx->get_base()->set_input_v_idxs(self_v_idxs, ubatch);
+    // Base tensors may not be allocated if this context has only SWA layers.
+    if (self_k_idxs && self_k_idxs->buffer) {
+        mctx->get_base()->set_input_k_idxs(self_k_idxs, ubatch);
+        mctx->get_base()->set_input_v_idxs(self_v_idxs, ubatch);
 
-    mctx->get_base()->set_input_kq_mask(self_kq_mask, ubatch, cparams.causal_attn);
+        mctx->get_base()->set_input_kq_mask(self_kq_mask, ubatch, cparams.causal_attn);
+        apply_mtp_tree_kq_mask_overlay(self_kq_mask, self_k_idxs,
+                mtp_tree_verify ? &mtp_tree_verify->kv_idxs_base : nullptr, mtp_tree_verify);
+    }
 
-    mctx->get_swa()->set_input_k_idxs(self_k_idxs_swa, ubatch);
-    mctx->get_swa()->set_input_v_idxs(self_v_idxs_swa, ubatch);
+    // SWA tensors may not be allocated if this context has only non-SWA layers.
+    if (self_k_idxs_swa && self_k_idxs_swa->buffer) {
+        mctx->get_swa()->set_input_k_idxs(self_k_idxs_swa, ubatch);
+        mctx->get_swa()->set_input_v_idxs(self_v_idxs_swa, ubatch);
 
-    mctx->get_swa()->set_input_kq_mask(self_kq_mask_swa, ubatch, cparams.causal_attn);
+        mctx->get_swa()->set_input_kq_mask(self_kq_mask_swa, ubatch, cparams.causal_attn);
+        apply_mtp_tree_kq_mask_overlay(self_kq_mask_swa, self_k_idxs_swa,
+                mtp_tree_verify ? &mtp_tree_verify->kv_idxs_swa : nullptr, mtp_tree_verify);
+    }
 
     if (self_k_rot) {
         mctx->get_base()->set_input_k_rot(self_k_rot);
@@ -526,17 +595,23 @@ bool llm_graph_input_attn_kv_iswa::can_reuse(const llm_graph_params & params) {
     const auto * mctx = static_cast<const llama_kv_cache_iswa_context *>(params.mctx);
 
     this->mctx = mctx;
+    this->mtp_tree_verify = params.mtp_tree_verify;
 
     bool res = true;
 
-    res &= self_k_idxs->ne[0] == params.ubatch.n_tokens;
-  //res &= self_v_idxs->ne[0] == params.ubatch.n_tokens; // TODO: need to move this to the unified cache and check there
+    if (self_k_idxs && self_k_idxs->buffer) {
+        res &= self_k_idxs->ne[0] == params.ubatch.n_tokens;
+      //res &= self_v_idxs->ne[0] == params.ubatch.n_tokens; // TODO: need to move this to the unified cache and check there
 
-    res &= self_k_idxs_swa->ne[0] == params.ubatch.n_tokens;
-  //res &= self_v_idxs_swa->ne[0] == params.ubatch.n_tokens; // TODO: need to move this to the unified cache and check there
+        res &= can_reuse_kq_mask(self_kq_mask, mctx->get_base(), params.ubatch, params.cparams);
+    }
 
-    res &= can_reuse_kq_mask(self_kq_mask,     mctx->get_base(), params.ubatch, params.cparams);
-    res &= can_reuse_kq_mask(self_kq_mask_swa, mctx->get_swa(),  params.ubatch, params.cparams);
+    if (self_k_idxs_swa && self_k_idxs_swa->buffer) {
+        res &= self_k_idxs_swa->ne[0] == params.ubatch.n_tokens;
+      //res &= self_v_idxs_swa->ne[0] == params.ubatch.n_tokens; // TODO: need to move this to the unified cache and check there
+
+        res &= can_reuse_kq_mask(self_kq_mask_swa, mctx->get_swa(), params.ubatch, params.cparams);
+    }
 
     return res;
 }
@@ -946,6 +1021,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     loras            (params.loras),
     mctx             (params.mctx),
     cross            (params.cross),
+    mtp_tree_verify  (params.mtp_tree_verify),
     samplers         (params.samplers),
     cb_func          (params.cb),
     res              (params.res),
@@ -2482,7 +2558,7 @@ ggml_tensor * llm_graph_context::build_attn(
 llm_graph_input_attn_kv_iswa * llm_graph_context::build_attn_inp_kv_iswa() const {
     const auto * mctx_cur = static_cast<const llama_kv_cache_iswa_context *>(mctx);
 
-    auto inp = std::make_unique<llm_graph_input_attn_kv_iswa>(hparams, cparams, mctx_cur);
+    auto inp = std::make_unique<llm_graph_input_attn_kv_iswa>(hparams, cparams, mctx_cur, mtp_tree_verify);
 
     {
         inp->self_k_idxs = mctx_cur->get_base()->build_input_k_idxs(ctx0, ubatch);
@@ -2660,7 +2736,7 @@ llm_graph_input_mem_hybrid_iswa * llm_graph_context::build_inp_mem_hybrid_iswa()
     // build iswa attention input
     const auto * attn_ctx = mctx_cur->get_attn();
 
-    auto inp_attn = std::make_unique<llm_graph_input_attn_kv_iswa>(hparams, cparams, attn_ctx);
+    auto inp_attn = std::make_unique<llm_graph_input_attn_kv_iswa>(hparams, cparams, attn_ctx, mtp_tree_verify);
 
     {
         inp_attn->self_k_idxs = attn_ctx->get_base()->build_input_k_idxs(ctx0, ubatch);
