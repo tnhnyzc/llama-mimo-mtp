@@ -287,7 +287,7 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
         case LLM_ARCH_STEP35:
             return new llama_model_step35(params);
         default:
-            GGML_ABORT("unimplemented model class");
+            throw std::runtime_error(std::string("unsupported model architecture: '") + llm_arch_name(arch) + "'");
     }
 
 }
@@ -1141,10 +1141,6 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
         hparams.n_rot_swa = hparams.n_rot_full;
         ml.get_key(LLM_KV_ROPE_DIMENSION_COUNT_SWA, hparams.n_rot_swa, false);
     }
-
-    // for differentiating model types
-    uint32_t n_vocab = 0;
-    ml.get_key(LLM_KV_VOCAB_SIZE, n_vocab, false) || ml.get_arr_n(LLM_KV_TOKENIZER_LIST, n_vocab, false);
 
     // for classifier models
     ml.get_arr(LLM_KV_CLASSIFIER_OUTPUT_LABELS, classifier_labels, false);
