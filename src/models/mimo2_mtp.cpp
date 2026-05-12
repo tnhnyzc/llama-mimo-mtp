@@ -74,6 +74,7 @@ void llama_model_mimo2_mtp::load_arch_tensors(llama_model_loader &) {
         layer.nextn.embed_tokens     = create_tensor(tn(LLM_TENSOR_NEXTN_EMBED_TOKENS,     "weight", i), {n_embd, n_vocab},    TENSOR_NOT_REQUIRED);
         layer.nextn.shared_head_head = create_tensor(tn(LLM_TENSOR_NEXTN_SHARED_HEAD_HEAD, "weight", i), {n_embd, n_vocab},    TENSOR_NOT_REQUIRED);
         layer.nextn.shared_head_norm = create_tensor(tn(LLM_TENSOR_NEXTN_SHARED_HEAD_NORM, "weight", i), {n_embd},             TENSOR_NOT_REQUIRED);
+        layer.layer_out_norm         = create_tensor(tn(LLM_TENSOR_LAYER_OUT_NORM,         "weight", i), {n_embd},             TENSOR_NOT_REQUIRED);
     }
 }
 
@@ -212,7 +213,9 @@ llama_model_mimo2_mtp::graph::graph(const llama_model & model, const llm_graph_p
         res->t_mtp_out = cur;
     }
 
-    ggml_tensor * head_norm_w = layer.nextn.shared_head_norm ? layer.nextn.shared_head_norm : model.output_norm;
+    ggml_tensor * head_norm_w = layer.nextn.shared_head_norm
+        ? layer.nextn.shared_head_norm
+        : (layer.layer_out_norm ? layer.layer_out_norm : model.output_norm);
     GGML_ASSERT(head_norm_w && "MIMO2_MTP missing shared head norm fallback");
     cur = build_norm(cur, head_norm_w, nullptr, LLM_NORM_RMS, -1);
     cb(cur, "mtp_shared_head_norm", -1);
