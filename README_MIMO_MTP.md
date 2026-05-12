@@ -70,6 +70,7 @@ Automatically handled:
 Recommended:
 
 - Start with `--spec-draft-n-max 1`.
+- For sampling, `--temp 0.6` is a good tested starting point.
 - Use `--flash-attn auto` or `--flash-attn on` on backends where it is supported.
 - Keep core `nextn` tensors high precision when quantizing small target quants such as IQ3_S.
 
