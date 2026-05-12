@@ -76,8 +76,6 @@ Recommended:
 Avoid for normal serving:
 
 - `--spec-draft-n-max 2` or higher, unless you are explicitly experimenting.
-- `LLAMA_MIMO_MTP_TREE_*` flags.
-- `LLAMA_MIMO_MTP_MULTI_CTX=1`, unless testing the multi-layer/tree branch behavior.
 - `--cache-reuse` / context-shift assumptions.
 
 ## Experimental Sampling Knobs
