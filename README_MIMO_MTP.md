@@ -24,9 +24,7 @@ Not proven:
 
 - dGPU performance.
 - `nmax=2+` as a useful speed path.
-- Prompt-cache reuse with MTP.
-- Context shift with MTP.
-- Production-ready packed/tree verification.
+- File/slot prompt-cache save/restore behavior with MTP.
 
 ## Quick Start
 
@@ -67,7 +65,7 @@ Automatically handled:
 
 - The internal MTP draft model is loaded with `override_arch = mimo2_mtp`.
 - The internal MTP draft load uses `use_mmap = false` so it does not mmap the whole target GGUF just to load the small draft subset.
-- Cache reuse and context shift are disabled when MTP is active.
+- `--cache-reuse` KV-shift reuse and context shift are disabled when MTP is active.
 
 Recommended:
 
@@ -80,7 +78,7 @@ Avoid for normal serving:
 - `--spec-draft-n-max 2` or higher, unless you are explicitly experimenting.
 - `LLAMA_MIMO_MTP_TREE_*` flags.
 - `LLAMA_MIMO_MTP_MULTI_CTX=1`, unless testing the multi-layer/tree branch behavior.
-- prompt-cache reuse / context shift assumptions.
+- `--cache-reuse` / context-shift assumptions.
 
 ## Experimental Sampling Knobs
 
