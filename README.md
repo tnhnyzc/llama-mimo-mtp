@@ -12,7 +12,7 @@ LLM inference in C/C++
 
 ## Fork Note
 
-Experimental same-GGUF MTP speculative decoding for MiMo-V2.5. Tested on Apple Silicon only, dGPU benchmarks welcome. See [README_MIMO_MTP.md](README_MIMO_MTP.md).
+Experimental same-GGUF MTP speculative decoding for MiMo-V2.5. Tested on Apple Silicon only, dGPU benchmarks welcome. A tested IQ3_S GGUF is available at [tnhnyzc/MiMO-V2.5-MTP-GGUF](https://huggingface.co/tnhnyzc/MiMO-V2.5-MTP-GGUF). See [README_MIMO_MTP.md](README_MIMO_MTP.md).
 
 ## Recent API changes
 

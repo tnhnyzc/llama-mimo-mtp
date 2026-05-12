@@ -26,6 +26,20 @@ Not proven:
 - `nmax=2+` as a useful speed path.
 - File/slot prompt-cache save/restore behavior with MTP.
 
+## Published GGUF
+
+A tested IQ3_S same-GGUF build is available at [tnhnyzc/MiMO-V2.5-MTP-GGUF](https://huggingface.co/tnhnyzc/MiMO-V2.5-MTP-GGUF). It still requires this fork; stock llama.cpp does not load the MiMo MTP draft architecture.
+
+```bash
+./build/bin/llama-server \
+  -hf tnhnyzc/MiMO-V2.5-MTP-GGUF \
+  --spec-type mtp \
+  --spec-draft-n-max 1 \
+  --temp 0.6 \
+  -np 1 \
+  -ngl 99
+```
+
 ## Quick Start
 
 ```bash
