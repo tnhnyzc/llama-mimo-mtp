@@ -81,7 +81,7 @@ Automatically handled:
 
 - The internal MTP draft model is loaded with `override_arch = mimo2_mtp`.
 - The internal MTP draft load uses `use_mmap = false` so it does not mmap the whole target GGUF just to load the small draft subset.
-- `--cache-reuse` KV-shift reuse and context shift are disabled when MTP is active.
+- In `llama-server`, `--cache-reuse` KV-shift reuse and `--context-shift` are explicitly disabled when `--spec-type mtp` is active.
 
 Recommended:
 
@@ -93,7 +93,7 @@ Recommended:
 Avoid for normal serving:
 
 - `--spec-draft-n-max 2` or higher, unless you are explicitly experimenting.
-- `--cache-reuse` / context-shift assumptions.
+- Relying on `--cache-reuse` or context-shift behavior with MTP.
 
 ## Experimental Sampling Knobs
 
