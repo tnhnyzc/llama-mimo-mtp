@@ -38,6 +38,11 @@ The original tested IQ3_S same-GGUF build is available at [tnhnyzc/MiMO-V2.5-MTP
 
 The current homelab quant being tested is an IQ2_XXS / Q8-infra MiMo-V2.5 GGUF with BF16 MTP tensors. It is intended for this fork until equivalent MiMo MTP support is available in upstream llama.cpp.
 
+Quant recipes, briefly:
+
+- IQ3_S build: follows AesSedai's recipe; dense/infra `Q6_K`, expert gate/up/down `IQ2_S`, MTP tensors appended.
+- IQ2_XXS / Q8-infra build: dense/infra `Q8_0`, expert gate/up/down `IQ2_XXS`, `nextn.eh_proj` `BF16`, norms/biases left `F32`.
+
 ## Quick Start
 
 Build with your backend as usual. For CUDA:
