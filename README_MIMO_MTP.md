@@ -79,11 +79,10 @@ MTP speedup is workload-dependent. Short, fresh synthetic prompts can understate
 | RTX 3090 + Tesla P40 + DDR5, IQ2_XXS / Q8-infra + BF16 MTP | MTP nmax=1 | real cached chat serving | about `22.6 t/s` average, with runs near `24-25 t/s` |
 | RTX 3090 + Tesla P40 + DDR5, IQ2_XXS / Q8-infra + BF16 MTP | no spec | short fresh direct `/completion` prompts | about `20.1 t/s` |
 | RTX 3090 + Tesla P40 + DDR5, IQ2_XXS / Q8-infra + BF16 MTP | MTP nmax=1 | short fresh direct `/completion` prompts | about `20.2 t/s` |
-| Apple M3 Max / Metal, IQ3_S | no spec | short fresh direct `/completion` prompts | about `31.4 t/s` |
-| Apple M3 Max / Metal, IQ3_S | MTP nmax=1 | short fresh direct `/completion` prompts | about `29.7 t/s` |
-| Apple M3 Max / Metal, IQ3_S | MTP nmax=1 | short single-turn smoke | about `34 t/s` |
 
-On the tested CUDA setup, real cached chat serving showed roughly a 20-25% generation-speed uplift with MTP enabled. Short direct prompt tests were mostly neutral. On Apple M3 Max / Metal, IQ3_S GGUFs built and smoke-tested successfully; the paired short-prompt measurement above was slightly slower with MTP than no spec.
+On the tested CUDA setup, real cached chat serving showed roughly a 20-25% generation-speed uplift with MTP enabled. Short direct prompt tests were mostly neutral.
+
+Apple M3 Max / Metal was used as a functionality check for the IQ3_S GGUF with BF16 MTP tensors. It built, loaded, and generated correctly with `--spec-type draft-mtp --spec-draft-n-max 1`. In a small paired short-prompt check, no-spec measured about `31.4 t/s` and MTP nmax=1 measured about `29.7 t/s`, so no Metal speedup is claimed from that test.
 
 Hardware placement, cache reuse, prompt shape, generation length, backend, and host load all matter.
 
