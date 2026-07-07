@@ -12,7 +12,7 @@ Tested locally:
 
 - Apple M3 Max, Metal, 128 GB unified memory.
 - Linux CUDA with RTX 3090 + Tesla P40 + DDR5 system memory.
-- MiMo-V2.5 IQ3_S GGUF with appended MTP tensors.
+- MiMo-V2.5 IQ3_S GGUF with appended BF16 MTP tensors.
 - MiMo-V2.5 IQ2_XXS / Q8-infra GGUF with BF16 MTP tensors.
 - `llama-server --spec-type draft-mtp --spec-draft-n-max 1`.
 
@@ -24,7 +24,7 @@ Published same-GGUF MTP builds are available at [tnhnyzc/MiMO-V2.5-MTP-GGUF](htt
 
 Quant recipes, briefly:
 
-- IQ3_S build: follows AesSedai's recipe; dense/infra `Q6_K`, expert gate/up/down `IQ2_S` / `IQ2_S` / `IQ3_S`, MTP tensors appended.
+- IQ3_S build: follows AesSedai's recipe; dense/infra `Q6_K`, expert gate/up/down `IQ2_S` / `IQ2_S` / `IQ3_S`, BF16 MTP tensors appended.
 - IQ2_XXS / Q8-infra build: dense/infra `Q8_0`, expert gate/up/down `IQ2_XXS`, `nextn.eh_proj` `BF16`, norms/biases left `F32`.
 
 ## Quick Start
