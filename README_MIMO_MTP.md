@@ -86,10 +86,10 @@ Apple M3 Max / Metal was also benchmarked with the IQ3_S GGUF with BF16 MTP tens
 
 | setup | mode | workload | observed generation speed |
 |---|---|---|---:|
-| Apple M3 Max / Metal, IQ3_S + BF16 MTP | no spec | 3 short direct `/completion` prompts | about `31.4 t/s` average |
-| Apple M3 Max / Metal, IQ3_S + BF16 MTP | MTP nmax=1 | same 3 short direct `/completion` prompts | about `29.7 t/s` average |
+| Apple M3 Max / Metal, IQ3_S + BF16 MTP | no spec | 3 direct `/completion` prompts, `512` generated tokens each | about `15.0 t/s` average |
+| Apple M3 Max / Metal, IQ3_S + BF16 MTP | MTP nmax=1 | same 3 direct `/completion` prompts, `512` generated tokens each | about `11.7 t/s` average |
 
-The Metal MTP run accepted draft tokens on those prompts, with observed acceptance around `78-86%`, but this small short-prompt benchmark did not show a speedup.
+The Metal MTP run accepted draft tokens on those prompts, with observed acceptance around `77-83%`, but this direct-completion benchmark did not show a speedup.
 
 Hardware placement, cache reuse, prompt shape, generation length, backend, and host load all matter.
 
