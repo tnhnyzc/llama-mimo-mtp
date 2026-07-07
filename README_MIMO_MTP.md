@@ -24,7 +24,7 @@ Published same-GGUF MTP builds are available at [tnhnyzc/MiMO-V2.5-MTP-GGUF](htt
 
 Quant recipes, briefly:
 
-- IQ3_S build: follows AesSedai's recipe; dense/infra `Q6_K`, expert gate/up/down `IQ2_S`, MTP tensors appended.
+- IQ3_S build: follows AesSedai's recipe; dense/infra `Q6_K`, expert gate/up/down `IQ2_S` / `IQ2_S` / `IQ3_S`, MTP tensors appended.
 - IQ2_XXS / Q8-infra build: dense/infra `Q8_0`, expert gate/up/down `IQ2_XXS`, `nextn.eh_proj` `BF16`, norms/biases left `F32`.
 
 ## Quick Start
