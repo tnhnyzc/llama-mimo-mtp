@@ -24,7 +24,7 @@ Published same-GGUF MTP builds are available at [tnhnyzc/MiMO-V2.5-MTP-GGUF](htt
 
 Quant recipes, briefly:
 
-- IQ3_S build: follows AesSedai's recipe; dense/infra `Q6_K`, expert gate/up/down `IQ2_S` / `IQ2_S` / `IQ3_S`, MTP tensors appended.
+- IQ3_S build: follows AesSedai's recipe; dense/infra `Q6_K`, expert gate/up/down `IQ2_S` / `IQ2_S` / `IQ3_S`, MTP tensors appended as `BF16`.
 - IQ2_XXS / Q8-infra build: dense/infra `Q8_0`, expert gate/up/down `IQ2_XXS`, `nextn.eh_proj` `BF16`, norms/biases left `F32`.
 
 ## Quick Start
@@ -83,7 +83,7 @@ MTP speedup is workload-dependent. Short, fresh synthetic prompts can understate
 | Apple M3 Max / Metal, IQ3_S | MTP nmax=1 | short fresh direct `/completion` prompts | about `29.7 t/s` |
 | Apple M3 Max / Metal, IQ3_S | MTP nmax=1 | short single-turn smoke | about `34 t/s` |
 
-On the tested CUDA setup, real cached chat serving showed roughly a 20-25% generation-speed uplift with MTP enabled. Short direct prompt tests were mostly neutral. On Apple M3 Max / Metal, IQ3_S GGUFs built and smoke-tested successfully; short-prompt MTP acceptance was good but did not produce a speedup in the measured prompt set.
+On the tested CUDA setup, real cached chat serving showed roughly a 20-25% generation-speed uplift with MTP enabled. Short direct prompt tests were mostly neutral. On Apple M3 Max / Metal, IQ3_S GGUFs built and smoke-tested successfully; the paired short-prompt measurement above was slightly slower with MTP than no spec.
 
 Hardware placement, cache reuse, prompt shape, generation length, backend, and host load all matter.
 
