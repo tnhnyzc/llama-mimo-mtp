@@ -14,7 +14,7 @@ LLM inference in C/C++
 
 ## Fork Note
 
-This fork tracks upstream `llama.cpp` and adds clean same-GGUF MTP draft support for MiMo-V2.5. It is intended for MiMo GGUFs that include the model's `nextn` / MTP tensors; no separate draft model file is needed. See [README_MIMO_MTP.md](README_MIMO_MTP.md).
+Experimental same-GGUF MTP draft support for MiMo-V2.5. It is intended for MiMo GGUFs that include the model's `nextn` / MTP tensors; no separate draft model file is needed. See [README_MIMO_MTP.md](README_MIMO_MTP.md).
 
 ## Recent API changes
 
