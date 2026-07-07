@@ -82,7 +82,14 @@ MTP speedup is workload-dependent. Short, fresh synthetic prompts can understate
 
 On the tested CUDA setup, real cached chat serving showed roughly a 20-25% generation-speed uplift with MTP enabled. Short direct prompt tests were mostly neutral.
 
-Apple M3 Max / Metal was used as a functionality check for the IQ3_S GGUF with BF16 MTP tensors. It built, loaded, and generated correctly with `--spec-type draft-mtp --spec-draft-n-max 1`. In a small paired short-prompt check, no-spec measured about `31.4 t/s` and MTP nmax=1 measured about `29.7 t/s`, so no Metal speedup is claimed from that test.
+Apple M3 Max / Metal was also benchmarked with the IQ3_S GGUF with BF16 MTP tensors:
+
+| setup | mode | workload | observed generation speed |
+|---|---|---|---:|
+| Apple M3 Max / Metal, IQ3_S + BF16 MTP | no spec | 3 short direct `/completion` prompts | about `31.4 t/s` average |
+| Apple M3 Max / Metal, IQ3_S + BF16 MTP | MTP nmax=1 | same 3 short direct `/completion` prompts | about `29.7 t/s` average |
+
+The Metal MTP run accepted draft tokens on those prompts, with observed acceptance around `78-86%`, but this small short-prompt benchmark did not show a speedup.
 
 Hardware placement, cache reuse, prompt shape, generation length, backend, and host load all matter.
 
