@@ -82,7 +82,16 @@ MTP speedup is workload-dependent. Short, fresh synthetic prompts can understate
 
 On the tested CUDA setup, real cached chat serving showed roughly a 20-25% generation-speed uplift with MTP enabled. Short direct prompt tests were mostly neutral.
 
-On Apple M3 Max / Metal with IQ3_S GGUFs, the branch built and smoke-tested successfully with both a local MiMo-V2.5 IQ3_S quant and an AesSedai-style IQ3_S quant. A short single-turn smoke with the local IQ3_S quant and `--spec-type draft-mtp --spec-draft-n-max 1` generated normally at about `34 t/s`. Longer short-prompt comparisons were prompt-dependent and did not show the same clear uplift as the cached CUDA serving workload.
+On Apple M3 Max / Metal with the IQ3_S GGUF, the earlier native-MTP fork showed prompt-dependent gains in short 64-token smoke tests at `ctx=2048`:
+
+| mode | prompt | tok/s | accepted |
+|---|---|---:|---:|
+| no spec | numbers | `20.56` | - |
+| MTP nmax=1 | numbers | `23.29` | `31/31` |
+| no spec | speculative_explain | `21.02` | - |
+| MTP nmax=1 | speculative_explain | `21.90` | `28/35` |
+
+Easy/high-agreement prompts improved around 10-20%, while lower-agreement prompts were closer to baseline.
 
 Hardware placement, cache reuse, prompt shape, generation length, backend, and host load all matter.
 
