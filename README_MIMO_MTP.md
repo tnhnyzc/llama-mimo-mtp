@@ -93,8 +93,6 @@ On Apple M3 Max / Metal with the IQ3_S GGUF, the earlier native-MTP fork showed 
 
 The useful signal is the trend: easy/high-agreement prompts improved around 10-20%, while lower-agreement prompts were closer to baseline.
 
-Hardware placement, cache reuse, prompt shape, generation length, backend, and host load all matter.
-
 ## Legacy Branch
 
 The previous public fork state is preserved as `legacy-native-mtp-2026-07-07` for reference. The current `main` branch is a cleaner upstream-based implementation using llama.cpp's `draft-mtp` path.
