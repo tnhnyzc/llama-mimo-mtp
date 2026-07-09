@@ -26,8 +26,17 @@ Quant recipes, briefly:
 
 - IQ3_S build: follows AesSedai's recipe; dense/infra `Q6_K`, expert gate/up/down `IQ2_S` / `IQ2_S` / `IQ3_S`, MTP tensors appended as `BF16`.
 - IQ2_XXS / Q8-infra build: dense/infra `Q8_0`, expert gate/up/down `IQ2_XXS`, `nextn.eh_proj` `BF16`, norms/biases left `F32`.
+- Q4_K / Q8-infra build: dense/infra `Q8_0`, expert gate/up/down `Q4_K`, `nextn.eh_proj` `BF16`, norms/biases left `F32`.
 
 ## Quick Start
+
+Download the recommended sharded GGUF:
+
+```bash
+huggingface-cli download tnhnyzc/MiMO-V2.5-MTP-GGUF \
+  --include "IQ2_XXS/*" \
+  --local-dir models/MiMO-V2.5-MTP-GGUF
+```
 
 Build with your backend as usual. For CUDA:
 
@@ -42,7 +51,7 @@ Run the conservative MTP mode:
 
 ```bash
 ./build-cuda/bin/llama-server \
-  --model /path/to/MiMo-V2.5-MTP.gguf \
+  --model models/MiMO-V2.5-MTP-GGUF/IQ2_XXS/MiMo-V2.5-IQ2_XXS-00001-of-00017.gguf \
   --spec-type draft-mtp \
   --spec-draft-n-max 1 \
   -np 1 \
@@ -51,6 +60,22 @@ Run the conservative MTP mode:
 ```
 
 Add your normal sampling, cache, and placement arguments as needed.
+
+For Apple Silicon / Metal:
+
+```bash
+cmake -S . -B build-metal \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DGGML_METAL=ON
+cmake --build build-metal --target llama-server -j
+
+./build-metal/bin/llama-server \
+  --model /path/to/MiMo-V2.5-MTP.gguf \
+  --spec-type draft-mtp \
+  --spec-draft-n-max 1 \
+  -np 1 \
+  -ngl 99
+```
 
 ## Runtime Notes
 
@@ -68,6 +93,8 @@ Recommended:
 - Use `--flash-attn on` where supported.
 - Keep MTP projection/norm/head tensors high precision when making very small target quants.
 - Benchmark with your real serving pattern, not only short fresh prompts.
+
+If you report results, please include GPU/CPU/RAM, quant folder, context size, `--spec-draft-n-max`, `-ngl`, tensor split/offload arguments, prompt-processing speed, generation speed, and draft acceptance.
 
 ## Expected Performance
 

@@ -14,7 +14,33 @@ LLM inference in C/C++
 
 ## Fork Note
 
-Experimental same-GGUF MTP draft support for MiMo-V2.5. It is intended for MiMo GGUFs that include the model's `nextn` / MTP tensors; no separate draft model file is needed. See [README_MIMO_MTP.md](README_MIMO_MTP.md).
+This fork adds experimental same-GGUF MTP draft support for MiMo-V2.5. It is intended for MiMo GGUFs that include the model's `nextn` / MTP tensors; no separate draft model file is needed.
+
+Published GGUFs: [tnhnyzc/MiMO-V2.5-MTP-GGUF](https://huggingface.co/tnhnyzc/MiMO-V2.5-MTP-GGUF)
+
+Recommended starting point:
+
+```bash
+git clone https://github.com/tnhnyzc/llama-mimo-mtp
+cd llama-mimo-mtp
+
+cmake -S . -B build-cuda -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON
+cmake --build build-cuda --target llama-server -j
+
+huggingface-cli download tnhnyzc/MiMO-V2.5-MTP-GGUF \
+  --include "IQ2_XXS/*" \
+  --local-dir models/MiMO-V2.5-MTP-GGUF
+
+./build-cuda/bin/llama-server \
+  --model models/MiMO-V2.5-MTP-GGUF/IQ2_XXS/MiMo-V2.5-IQ2_XXS-00001-of-00017.gguf \
+  --spec-type draft-mtp \
+  --spec-draft-n-max 1 \
+  -np 1 \
+  -ngl 99 \
+  -fa on
+```
+
+More details, tested setups, and quant recipes: [README_MIMO_MTP.md](README_MIMO_MTP.md).
 
 ## Recent API changes
 
